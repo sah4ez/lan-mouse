@@ -1859,6 +1859,7 @@ dependencies = [
  "lan-mouse-ipc",
  "lan-mouse-proto",
  "libc",
+ "libgit2-sys",
  "local-channel",
  "log",
  "rcgen",

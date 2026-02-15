@@ -277,7 +277,7 @@ impl X11InputCapture {
 
     /// Process mouse button events
     unsafe fn process_button_event(
-        event_tx: &mpsc::Sender<Result<(Position, CaptureError>, CaptureEvent>>,
+        event_tx: &mpsc::Sender<Result<(Position, CaptureEvent), CaptureError>>,
         event_data: *const u8,
         event_type: u8,
     ) {
@@ -295,7 +295,7 @@ impl X11InputCapture {
 
     /// Process mouse motion events
     unsafe fn process_motion_event(
-        event_tx: &mpsc::Sender<Result<(Position, CaptureError), CaptureEvent>>,
+        event_tx: &mpsc::Sender<Result<(Position, CaptureEvent), CaptureError>>,
         event_data: *const u8,
     ) {
         let x = *(event_data.offset(1) as *const i16) as i32;

@@ -52,11 +52,19 @@ pub(crate) enum EmulationEvent {
     EmulationEnabled,
     /// capture should be released
     ReleaseNotify,
+    /// cursor crossed screen edge - request to send Enter event to remote
+    EdgeCrossed {
+        /// address of the connection
+        addr: SocketAddr,
+        /// position where cursor crossed the edge
+        pos: lan_mouse_ipc::Position,
+    },
 }
 
 enum EmulationRequest {
     Reenable,
     Release(SocketAddr),
+    Enter(SocketAddr, lan_mouse_ipc::Position),
     ChangePort(u16),
     Terminate,
 }
@@ -86,6 +94,12 @@ impl Emulation {
     pub(crate) fn send_leave_event(&self, addr: SocketAddr) {
         self.request_tx
             .send(EmulationRequest::Release(addr))
+            .expect("channel closed");
+    }
+
+    pub(crate) fn send_enter_event(&self, addr: SocketAddr, pos: lan_mouse_ipc::Position) {
+        self.request_tx
+            .send(EmulationRequest::Enter(addr, pos))
             .expect("channel closed");
     }
 
@@ -172,6 +186,10 @@ impl ListenTask {
                     EmulationRequest::Reenable => self.emulation_proxy.reenable(),
                     // notify the other end that we hit a barrier (should release capture)
                     EmulationRequest::Release(addr) => self.listener.reply(addr, ProtoEvent::Leave(0)).await,
+                    // send Enter event to remote machine
+                    EmulationRequest::Enter(addr, pos) => {
+                        self.listener.reply(addr, ProtoEvent::Enter(pos.into())).await;
+                    }
                     EmulationRequest::ChangePort(port) => {
                         self.listener.request_port_change(port);
                         let result = self.listener.port_changed().await;
@@ -213,6 +231,7 @@ enum ProxyRequest {
     Remove(SocketAddr),
     Terminate,
     Reenable,
+    EdgeCrossed(SocketAddr, lan_mouse_ipc::Position),
 }
 
 impl EmulationProxy {
@@ -271,6 +290,12 @@ impl EmulationProxy {
             .expect("channel closed");
     }
 
+    fn edge_crossed(&self, addr: SocketAddr, pos: lan_mouse_ipc::Position) {
+        self.request_tx
+            .send(ProxyRequest::EdgeCrossed(addr, pos))
+            .expect("channel closed");
+    }
+
     async fn terminate(&mut self) {
         self.exit_requested.replace(true);
         self.request_tx
@@ -305,6 +330,7 @@ impl EmulationTask {
                     ProxyRequest::Terminate => return,
                     ProxyRequest::Input(..) => { /* emulation inactive => ignore */ }
                     ProxyRequest::Remove(..) => { /* emulation inactive => ignore */ }
+                    ProxyRequest::EdgeCrossed(..) => { /* emulation inactive => ignore */ }
                 }
             }
         }
@@ -377,6 +403,10 @@ impl EmulationTask {
                     }
                     ProxyRequest::Terminate => break Ok(()),
                     ProxyRequest::Reenable => continue,
+                    ProxyRequest::EdgeCrossed(addr, pos) => {
+                        log::info!("edge crossed at position {:?} for connection {}", pos, addr);
+                        self.event_tx.send(EmulationEvent::EdgeCrossed { addr, pos }).expect("channel closed");
+                    }
                 },
             }
         }
@@ -399,6 +429,7 @@ async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>) {
             ProxyRequest::Input(_, _) => continue,
             ProxyRequest::Remove(_) => continue,
             ProxyRequest::Reenable => continue,
+            ProxyRequest::EdgeCrossed(_, _) => continue,
         }
     }
 }

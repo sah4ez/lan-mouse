@@ -1703,6 +1703,7 @@ dependencies = [
  "futures",
  "input-event",
  "keycode",
+ "lan-mouse-ipc",
  "log",
  "once_cell",
  "reis",
@@ -1920,6 +1921,7 @@ name = "lan-mouse-proto"
 version = "0.2.0"
 dependencies = [
  "input-event",
+ "lan-mouse-ipc",
  "num_enum",
  "paste",
  "thiserror 2.0.12",

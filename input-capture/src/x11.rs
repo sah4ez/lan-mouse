@@ -311,7 +311,7 @@ impl X11InputCapture {
     }
 
     /// Check if cursor has crossed an edge
-    async fn check_edge_crossing(&self) -> Option<Position> {
+    fn check_edge_crossing(&self) -> Option<Position> {
         let mut root_x: i32 = 0;
         let mut root_y: i32 = 0;
         let mut win_x: i32 = 0;
@@ -334,20 +334,23 @@ impl X11InputCapture {
             );
         }
 
-        // Update cursor position
-        let mut pos = self.cursor_pos.lock().await;
-        *pos = (root_x, root_y);
-        drop(pos);
+        // Update cursor position using blocking lock
+        // Note: This is called from poll_next which is not async, so we use try_lock
+        // to avoid blocking. If the lock is contended, we skip the update this time.
+        if let Ok(mut pos) = self.cursor_pos.try_lock() {
+            *pos = (root_x, root_y);
+        }
 
-        // Check for edge crossing
-        let active_clients = self.active_clients.lock().await;
-        for &position in active_clients.iter() {
-            match position {
-                Position::Left if root_x <= 0 => return Some(Position::Left),
-                Position::Right if root_x >= self.screen_width - 1 => return Some(Position::Right),
-                Position::Top if root_y <= 0 => return Some(Position::Top),
-                Position::Bottom if root_y >= self.screen_height - 1 => return Some(Position::Bottom),
-                _ => {}
+        // Check for edge crossing using blocking lock
+        if let Ok(active_clients) = self.active_clients.try_lock() {
+            for &position in active_clients.iter() {
+                match position {
+                    Position::Left if root_x <= 0 => return Some(Position::Left),
+                    Position::Right if root_x >= self.screen_width - 1 => return Some(Position::Right),
+                    Position::Top if root_y <= 0 => return Some(Position::Top),
+                    Position::Bottom if root_y >= self.screen_height - 1 => return Some(Position::Bottom),
+                    _ => {}
+                }
             }
         }
 

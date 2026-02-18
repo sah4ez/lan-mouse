@@ -30,9 +30,13 @@ impl X11Emulation {
         let display = unsafe {
             match xlib::XOpenDisplay(ptr::null()) {
                 d if std::ptr::eq(d, ptr::null_mut::<xlib::Display>()) => {
-                    log::error!("Failed to open X11 display. Make sure you're running in an X11 session.");
-                    log::error!("DISPLAY variable is set to: {}", display_env);
-                    log::error!("If you're using Wayland, you may need to run with XWayland or use a Wayland-compatible backend.");
+                    let error_msg = format!(
+                        "Failed to open X11 display for emulation. DISPLAY variable is set to: '{}'. \
+                        Make sure you're running in an X11 session. \
+                        If you're using Wayland, you may need to run with XWayland or use a Wayland-compatible backend.",
+                        display_env
+                    );
+                    log::error!("{}", error_msg);
                     Err(X11EmulationCreationError::OpenDisplay)
                 }
                 display => Ok(display),

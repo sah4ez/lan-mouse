@@ -383,15 +383,20 @@ async fn create(
         }
     };
 
-    for backend in backends {
-        match create_backend(backend).await {
+    for backend in &backends {
+        log::info!("Attempting to create {} input capture backend...", backend);
+        match create_backend(*backend).await {
             Ok(b) => {
-                log::info!("using capture backend: {backend}");
+                log::info!("Successfully created capture backend: {backend}");
                 return Ok(b);
             }
             Err(e) if e.cancelled_by_user() => return Err(e),
-            Err(e) => log::warn!("{backend} input capture backend unavailable: {e}"),
+            Err(e) => {
+                log::warn!("Failed to create {} input capture backend: {}", backend, e);
+                log::warn!("Trying next available backend...");
+            }
         }
     }
+    log::error!("No input capture backend available. Tried: {:?}", backends);
     Err(CaptureCreationError::NoAvailableBackend)
 }

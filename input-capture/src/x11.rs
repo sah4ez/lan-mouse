@@ -55,9 +55,13 @@ impl X11InputCapture {
         let display = unsafe {
             match xlib::XOpenDisplay(ptr::null()) {
                 d if ptr::eq(d, ptr::null_mut::<xlib::Display>()) => {
-                    log::error!("Failed to open X11 display. Make sure you're running in an X11 session.");
-                    log::error!("DISPLAY variable is set to: {}", display_env);
-                    log::error!("If you're using Wayland, you may need to run with XWayland or use a Wayland-compatible backend.");
+                    let error_msg = format!(
+                        "Failed to open X11 display. DISPLAY variable is set to: '{}'. \
+                        Make sure you're running in an X11 session. \
+                        If you're using Wayland, you may need to run with XWayland or use a Wayland-compatible backend.",
+                        display_env
+                    );
+                    log::error!("{}", error_msg);
                     return Err(X11InputCaptureCreationError::OpenDisplay);
                 }
                 display => display,
@@ -70,9 +74,11 @@ impl X11InputCapture {
         log::info!("X11 screen dimensions: {}x{}", screen_width, screen_height);
 
         // Open separate display for XRecord
+        log::debug!("Opening separate display for XRecord");
         let record_display = unsafe {
             match xlib::XOpenDisplay(ptr::null()) {
                 d if ptr::eq(d, ptr::null_mut::<xlib::Display>()) => {
+                    log::error!("Failed to open X11 display for XRecord");
                     unsafe { XCloseDisplay(display) };
                     return Err(X11InputCaptureCreationError::OpenDisplay);
                 }
@@ -81,6 +87,7 @@ impl X11InputCapture {
         };
 
         // Check XRecord availability
+        log::debug!("Checking XRecord extension availability");
         let mut major_version = 0;
         let mut minor_version = 0;
         let record_available = unsafe {
@@ -92,9 +99,13 @@ impl X11InputCapture {
         };
 
         if record_available == 0 {
-            log::error!("XRecord extension is not available on this X server.");
-            log::error!("This extension is required for input capture on X11.");
-            log::error!("Please ensure your X server has the XRecord extension enabled.");
+            let error_msg = format!(
+                "XRecord extension is not available on this X server. \
+                This extension is required for input capture on X11. \
+                Please ensure your X server has the XRecord extension enabled. \
+                You can check this by running: 'xdpyinfo | grep RECORD'"
+            );
+            log::error!("{}", error_msg);
             unsafe {
                 XCloseDisplay(display);
                 XCloseDisplay(record_display);
@@ -105,8 +116,10 @@ impl X11InputCapture {
         log::info!("XRecord version: {}.{}", major_version, minor_version);
 
         // Create XRecord context
+        log::debug!("Creating XRecord context");
         let record_context = Self::create_record_context(record_display)
             .map_err(|e| {
+                log::error!("Failed to create XRecord context: {:?}", e);
                 unsafe {
                     XCloseDisplay(display);
                     XCloseDisplay(record_display);
@@ -124,7 +137,9 @@ impl X11InputCapture {
         let cursor_pos_clone = Arc::clone(&cursor_pos);
 
         // Start XRecord thread
+        log::debug!("Starting XRecord thread");
         let record_thread = thread::spawn(move || {
+            log::info!("XRecord thread started");
             Self::run_record_callback(
                 record_display,
                 record_context,

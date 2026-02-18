@@ -150,7 +150,7 @@ impl X11InputCapture {
         let record_thread = thread::spawn(move || {
             log::info!("XRecord thread started");
             Self::run_record_callback(
-                record_display.0,
+                record_display,
                 record_context,
                 event_tx,
                 active_clients_clone,
@@ -222,7 +222,7 @@ impl X11InputCapture {
 
     /// Run XRecord callback in a separate thread
     fn run_record_callback(
-        display: *mut xlib::Display,
+        display: SendDisplay,
         context: xrecord::XRecordContext,
         event_tx: mpsc::Sender<Result<(Position, CaptureEvent), CaptureError>>,
         active_clients: Arc<Mutex<HashSet<Position>>>,
@@ -233,10 +233,10 @@ impl X11InputCapture {
         // Enable XRecord context
         let result = unsafe {
             xrecord::XRecordEnableContextAsync(
-                display,
+                display.0,
                 context,
                 Some(Self::record_callback),
-                &event_tx as *const _ as *mut libc::c_void,
+                &event_tx as *const _ as *mut u8,
             )
         };
 
@@ -256,7 +256,7 @@ impl X11InputCapture {
 
                 // Process X11 events
                 let mut event: xlib::XEvent = std::mem::zeroed();
-                xlib::XNextEvent(display, &mut event);
+                xlib::XNextEvent(display.0, &mut event);
             }
         }
 

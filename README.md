@@ -390,6 +390,16 @@ port = 4242
 
 Where `left` can be either `left`, `right`, `top` or `bottom`.
 
+### Troubleshooting Connection Issues
+
+If you're experiencing connection problems between lan-mouse daemons (e.g., "Connection timed out" errors), please refer to the [Connection Troubleshooting Guide](docs/CONNECTION_TROUBLESHOOTING.md) for detailed diagnostic steps and solutions.
+
+A diagnostic script is also available to help identify network connectivity issues:
+
+```bash
+./scripts/diagnose-connection.sh [remote-ip]
+```
+
 ## Roadmap
 - [x] Graphical frontend (gtk + libadwaita)
 - [x] respect xdg-config-home for config file location.

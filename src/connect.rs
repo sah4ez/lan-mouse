@@ -47,12 +47,20 @@ async fn connect(
     cert: Certificate,
 ) -> Result<(Arc<dyn Conn + Sync + Send>, SocketAddr), (SocketAddr, LanMouseConnectionError)> {
     log::info!("connecting to {addr} ...");
+    log::debug!("Creating UDP socket for connection to {addr}");
     let conn = Arc::new(
         UdpSocket::bind("0.0.0.0:0")
             .await
-            .map_err(|e| (addr, e.into()))?,
+            .map_err(|e| {
+                log::error!("Failed to bind UDP socket: {e}");
+                (addr, e.into())
+            })?,
     );
-    conn.connect(addr).await.map_err(|e| (addr, e.into()))?;
+    log::debug!("Connecting UDP socket to {addr}");
+    conn.connect(addr).await.map_err(|e| {
+        log::error!("Failed to connect UDP socket to {addr}: {e}");
+        (addr, e.into())
+    })?;
     let config = Config {
         certificates: vec![cert],
         server_name: "ignored".to_owned(),
@@ -63,11 +71,30 @@ async fn connect(
         client_auth: webrtc_dtls::config::ClientAuthType::RequestClientCert,
         ..Default::default()
     };
+    log::debug!("Starting DTLS handshake with {addr} (timeout: {:?})", DEFAULT_CONNECTION_TIMEOUT);
     let timeout = tokio::time::sleep(DEFAULT_CONNECTION_TIMEOUT);
     tokio::select! {
-        _ = timeout => Err((addr, LanMouseConnectionError::Timeout)),
+        _ = timeout => {
+            log::error!("Connection to {addr} timed out after {:?}", DEFAULT_CONNECTION_TIMEOUT);
+            log::error!("This typically means:");
+            log::error!("  1. The remote lan-mouse daemon is not running");
+            log::error!("  2. The remote daemon is not listening on port {}", addr.port());
+            log::error!("  3. A firewall is blocking the connection");
+            log::error!("  4. The IP address {} is incorrect or unreachable", addr.ip());
+            log::error!("");
+            log::error!("Troubleshooting steps:");
+            log::error!("  1. Run the diagnostic script: ./scripts/diagnose-connection.sh {}", addr.ip());
+            log::error!("  2. Check if lan-mouse is running on the remote machine: ssh {} 'pgrep -f lan-mouse'", addr.ip());
+            log::error!("  3. Test network connectivity: ping -c 3 {}", addr.ip());
+            log::error!("  4. Check if the port is open: nc -zv {} {}", addr.ip(), addr.port());
+            log::error!("  5. Verify firewall settings on both machines");
+            Err((addr, LanMouseConnectionError::Timeout))
+        }
         result = DTLSConn::new(conn, config, true, None) => match result {
-            Ok(dtls_conn) => Ok((Arc::new(dtls_conn), addr)),
+            Ok(dtls_conn) => {
+                log::info!("Successfully established DTLS connection with {addr}");
+                Ok((Arc::new(dtls_conn), addr))
+            }
             Err(e) => {
                 log::error!("DTLS handshake failed with {addr}: {e}");
                 log::error!("This may be due to:");
@@ -90,17 +117,26 @@ async fn connect_any(
     addrs: &[SocketAddr],
     cert: Certificate,
 ) -> Result<(Arc<dyn Conn + Send + Sync>, SocketAddr), LanMouseConnectionError> {
+    log::debug!("Attempting to connect to {} address(es): {:?}", addrs.len(), addrs);
     let mut joinset = JoinSet::new();
     for &addr in addrs {
+        log::debug!("Spawning connection task for {addr}");
         joinset.spawn_local(connect(addr, cert.clone()));
     }
     loop {
         match joinset.join_next().await {
-            None => return Err(LanMouseConnectionError::NotConnected),
+            None => {
+                log::error!("All connection attempts failed for addresses: {:?}", addrs);
+                return Err(LanMouseConnectionError::NotConnected);
+            }
             Some(r) => match r.expect("join error") {
-                Ok(conn) => return Ok(conn),
+                Ok(conn) => {
+                    log::info!("Successfully connected to one of the addresses");
+                    return Ok(conn);
+                }
                 Err((a, e)) => {
-                    log::warn!("failed to connect to {a}: `{e}`")
+                    log::warn!("failed to connect to {a}: `{e}`");
+                    log::debug!("Remaining connection attempts: {}", joinset.len());
                 }
             },
         };
@@ -200,10 +236,13 @@ async fn connect_to_handle(
             .map(|a| SocketAddr::new(a, port))
             .collect::<Vec<_>>();
         log::info!("client ({handle}) connecting ... (ips: {addrs:?})");
+        log::debug!("Attempting to connect to {} address(es)", addrs.len());
         let res = connect_any(&addrs, cert).await;
         let (conn, addr) = match res {
             Ok(c) => c,
             Err(e) => {
+                log::warn!("Failed to connect client {handle} to any of the addresses: {e}");
+                log::warn!("Client {handle} will remain disconnected until the remote daemon becomes available");
                 connecting.lock().await.remove(&handle);
                 return Err(e);
             }
@@ -228,6 +267,7 @@ async fn connect_to_handle(
         ));
         return Ok(());
     }
+    log::warn!("No IP addresses configured for client {handle}");
     connecting.lock().await.remove(&handle);
     Err(LanMouseConnectionError::NotConnected)
 }

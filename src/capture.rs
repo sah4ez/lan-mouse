@@ -355,7 +355,17 @@ impl CaptureTask {
 
         if let Err(e) = self.conn.send(event, handle).await {
             const DUR: Duration = Duration::from_millis(500);
-            debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
+            debounce!(
+                PREV_LOG,
+                DUR,
+                {
+                    log::warn!("releasing capture: {e}");
+                    log::debug!("Client {handle} is not connected, attempting to establish connection...");
+                    log::debug!("This warning will repeat until the connection is established");
+                    log::debug!("Check the logs above for connection attempts and any errors");
+                    log::debug!("If connection keeps failing, run: ./scripts/diagnose-connection.sh <remote-ip>");
+                }
+            );
             capture.release().await?;
         }
         Ok(())

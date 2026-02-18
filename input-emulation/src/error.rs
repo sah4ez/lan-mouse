@@ -63,7 +63,7 @@ pub enum EmulationCreationError {
     #[cfg(windows)]
     #[error("windows: `{0}`")]
     Windows(#[from] WindowsEmulationCreationError),
-    #[error("capture error")]
+    #[error("no backend available")]
     NoAvailableBackend,
 }
 

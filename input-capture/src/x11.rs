@@ -180,10 +180,13 @@ impl X11InputCapture {
             (*record_range).core_events.last = xlib::MotionNotify as u8;
 
             // Create XRecord context
+            // Note: XRecordCreateContext expects a pointer to an array of XRecordRange pointers
+            // We need to create an array of pointers, not just pass the range pointer directly
+            let mut ranges: [*mut xrecord::XRecordRange; 1] = [record_range];
             let context = xrecord::XRecordCreateContext(
                 display,
-                0,
-                &mut record_range as *mut _ as *mut *mut xrecord::XRecordClientInfo,
+                0, // XRecordAllClients
+                ranges.as_mut_ptr(),
                 1,
             );
 

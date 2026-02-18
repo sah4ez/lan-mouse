@@ -45,6 +45,9 @@ pub struct X11InputCapture {
 // Note: X11 display pointers are not thread-safe, but we need to handle this carefully
 // The record_display is used in a separate thread for XRecord callback
 // We rely on the fact that X11 display connections are thread-local
+// We implement Send manually because we know what we're doing with X11 pointers
+unsafe impl Send for X11InputCapture {}
+unsafe impl Sync for X11InputCapture {}
 
 impl X11InputCapture {
     /// Create a new X11 input capture instance

@@ -42,8 +42,9 @@ pub struct X11InputCapture {
 // X11 display pointers are not thread-safe, but we need to send them across threads
 // for the XRecord callback. We use unsafe to implement Send, but we must ensure
 // proper synchronization.
-unsafe impl Send for X11InputCapture {}
-unsafe impl Sync for X11InputCapture {}
+// Note: X11 display pointers are not thread-safe, but we need to handle this carefully
+// The record_display is used in a separate thread for XRecord callback
+// We rely on the fact that X11 display connections are thread-local
 
 impl X11InputCapture {
     /// Create a new X11 input capture instance
@@ -201,7 +202,6 @@ impl X11InputCapture {
                 0, // nclients
                 ranges.as_mut_ptr(),
                 1, // nranges
-                ptr::null_mut(), // intercept_proc (NULL for default)
             );
 
             // Free the range
@@ -231,7 +231,7 @@ impl X11InputCapture {
                 display,
                 context,
                 Some(Self::record_callback),
-                &event_tx as *const _ as *mut libc::c_void,
+                &event_tx as *const _ as *mut u8,
             )
         };
 
@@ -261,10 +261,10 @@ impl X11InputCapture {
     /// XRecord callback function
     unsafe extern "C" fn record_callback(
         closure: *mut libc::c_void,
-        intercept_data: *mut libc::c_void,
+        intercept_data: *mut XRecordInterceptData,
     ) {
         let event_tx = &*(closure as *const mpsc::Sender<Result<(Position, CaptureEvent), CaptureError>>);
-        let data = intercept_data as *mut XRecordInterceptData;
+        let data = &*intercept_data;
 
         if data.is_null() {
             return;
@@ -280,7 +280,7 @@ impl X11InputCapture {
         let event_data = data.data;
         let event_type = *(event_data as *const u8);
 
-        match event_type {
+        match event_type as i32 {
             xlib::KeyPress | xlib::KeyRelease => {
                 Self::process_keyboard_event(event_tx, event_data, event_type);
             }

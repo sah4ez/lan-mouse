@@ -107,13 +107,6 @@ impl LanMouseListener {
             extended_master_secret: ExtendedMasterSecretType::Request,
             client_auth: RequireAnyClientCert,
             verify_peer_certificate,
-            // Enable more cipher suites for better compatibility
-            cipher_suites: vec![
-                webrtc_dtls::crypto::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-                webrtc_dtls::crypto::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-                webrtc_dtls::crypto::cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-                webrtc_dtls::crypto::cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-            ],
             ..Default::default()
         };
 

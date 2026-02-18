@@ -15,6 +15,9 @@ pub use error::{CaptureCreationError, CaptureError, InputCaptureError};
 
 pub mod error;
 
+type CaptureResult = Result<(Position, CaptureEvent), CaptureError>;
+type CaptureStream = Box<dyn Capture<Item = CaptureResult>>;
+
 /// Display server type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DisplayServer {
@@ -327,10 +330,7 @@ async fn create_backend(
 
 async fn create(
     backend: Option<Backend>,
-) -> Result<
-    Box<dyn Capture<Item = Result<(Position, CaptureEvent), CaptureError>>,
-    CaptureCreationError,
-> {
+) -> Result<CaptureStream, CaptureCreationError> {
     if let Some(backend) = backend {
         let b = create_backend(backend).await;
         if b.is_ok() {

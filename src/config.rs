@@ -22,8 +22,10 @@ use input_event::scancode::{
     Linux::{KeyLeftAlt, KeyLeftCtrl, KeyLeftMeta, KeyLeftShift},
 };
 
+#[cfg(feature = "shadow_rs")]
 use shadow_rs::shadow;
 
+#[cfg(feature = "shadow_rs")]
 shadow!(build);
 
 const CONFIG_FILE_NAME: &str = "config.toml";
@@ -76,7 +78,7 @@ impl ConfigToml {
 }
 
 #[derive(Parser, Debug)]
-#[command(author, version=build::CLAP_LONG_VERSION, about, long_about = None)]
+#[command(author, version=env!("CARGO_PKG_VERSION"), about, long_about = None)]
 struct Args {
     /// the listen port for lan-mouse
     #[arg(short, long)]

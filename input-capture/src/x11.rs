@@ -18,12 +18,24 @@ use input_event::{Event, KeyboardEvent, PointerEvent};
 
 use super::{Capture, CaptureError, CaptureEvent, Position, error::X11InputCaptureCreationError};
 
+/// Wrapper for X11 display pointer that is Send-safe
+///
+/// X11 display pointers are not thread-safe, but we need to send them across threads
+/// for the XRecord callback. This wrapper implements Send to allow this, but we must
+/// ensure proper synchronization by only using the display in the thread it was sent to.
+struct SendDisplay(*mut xlib::Display);
+
+// SAFETY: X11 display pointers are not thread-safe, but we implement Send to allow
+// moving the display pointer to another thread. We ensure that each display is only
+// used in a single thread at a time.
+unsafe impl Send for SendDisplay {}
+
 /// X11 input capture backend using XRecord extension
 pub struct X11InputCapture {
     /// X11 display connection
-    display: *mut xlib::Display,
+    display: SendDisplay,
     /// XRecord display connection (separate from main display)
-    record_display: *mut xlib::Display,
+    record_display: SendDisplay,
     /// XRecord context for event capture
     record_context: xrecord::XRecordContext,
     /// Receiver for captured events
@@ -38,16 +50,6 @@ pub struct X11InputCapture {
     /// Thread handle for XRecord callback
     record_thread: Option<thread::JoinHandle<()>>,
 }
-
-// X11 display pointers are not thread-safe, but we need to send them across threads
-// for the XRecord callback. We use unsafe to implement Send, but we must ensure
-// proper synchronization.
-// Note: X11 display pointers are not thread-safe, but we need to handle this carefully
-// The record_display is used in a separate thread for XRecord callback
-// We rely on the fact that X11 display connections are thread-local
-// We implement Send manually because we know what we're doing with X11 pointers
-unsafe impl Send for X11InputCapture {}
-unsafe impl Sync for X11InputCapture {}
 
 impl X11InputCapture {
     /// Create a new X11 input capture instance
@@ -71,13 +73,13 @@ impl X11InputCapture {
                     log::error!("{}", error_msg);
                     return Err(X11InputCaptureCreationError::OpenDisplay);
                 }
-                display => display,
+                display => SendDisplay(display),
             }
         };
 
         // Get screen dimensions
-        let screen_width = unsafe { XDisplayWidth(display, 0) };
-        let screen_height = unsafe { XDisplayHeight(display, 0) };
+        let screen_width = unsafe { XDisplayWidth(display.0, 0) };
+        let screen_height = unsafe { XDisplayHeight(display.0, 0) };
         log::info!("X11 screen dimensions: {}x{}", screen_width, screen_height);
 
         // Open separate display for XRecord
@@ -86,10 +88,10 @@ impl X11InputCapture {
             match xlib::XOpenDisplay(ptr::null()) {
                 d if ptr::eq(d, ptr::null_mut::<xlib::Display>()) => {
                     log::error!("Failed to open X11 display for XRecord");
-                    unsafe { XCloseDisplay(display) };
+                    unsafe { XCloseDisplay(display.0) };
                     return Err(X11InputCaptureCreationError::OpenDisplay);
                 }
-                display => display,
+                display => SendDisplay(display),
             }
         };
 
@@ -99,7 +101,7 @@ impl X11InputCapture {
         let mut minor_version = 0;
         let record_available = unsafe {
             xrecord::XRecordQueryVersion(
-                record_display,
+                record_display.0,
                 &mut major_version,
                 &mut minor_version,
             )
@@ -114,8 +116,8 @@ impl X11InputCapture {
             );
             log::error!("{}", error_msg);
             unsafe {
-                XCloseDisplay(display);
-                XCloseDisplay(record_display);
+                XCloseDisplay(display.0);
+                XCloseDisplay(record_display.0);
             }
             return Err(X11InputCaptureCreationError::XRecordNotAvailable);
         }
@@ -124,12 +126,12 @@ impl X11InputCapture {
 
         // Create XRecord context
         log::debug!("Creating XRecord context");
-        let record_context = Self::create_record_context(record_display)
+        let record_context = Self::create_record_context(record_display.0)
             .map_err(|e| {
                 log::error!("Failed to create XRecord context: {:?}", e);
                 unsafe {
-                    XCloseDisplay(display);
-                    XCloseDisplay(record_display);
+                    XCloseDisplay(display.0);
+                    XCloseDisplay(record_display.0);
                 }
                 e
             })?;
@@ -148,7 +150,7 @@ impl X11InputCapture {
         let record_thread = thread::spawn(move || {
             log::info!("XRecord thread started");
             Self::run_record_callback(
-                record_display,
+                record_display.0,
                 record_context,
                 event_tx,
                 active_clients_clone,
@@ -175,7 +177,7 @@ impl X11InputCapture {
     ) -> Result<xrecord::XRecordContext, X11InputCaptureCreationError> {
         unsafe {
             // Allocate XRecord range
-            let mut record_range: *mut xrecord::XRecordRange =
+            let record_range: *mut xrecord::XRecordRange =
                 xrecord::XRecordAllocRange();
 
             if record_range.is_null() {
@@ -234,7 +236,7 @@ impl X11InputCapture {
                 display,
                 context,
                 Some(Self::record_callback),
-                &event_tx as *const _ as *mut u8,
+                &event_tx as *const _ as *mut libc::c_void,
             )
         };
 
@@ -266,14 +268,13 @@ impl X11InputCapture {
         closure: *mut libc::c_void,
         intercept_data: *mut XRecordInterceptData,
     ) {
-        let event_tx = &*(closure as *const mpsc::Sender<Result<(Position, CaptureEvent), CaptureError>>);
-        let data = &*intercept_data;
-
-        if data.is_null() {
+        // Check if intercept_data is null before dereferencing
+        if intercept_data.is_null() {
             return;
         }
 
-        let data = &*data;
+        let event_tx = &*(closure as *const mpsc::Sender<Result<(Position, CaptureEvent), CaptureError>>);
+        let data = &*intercept_data;
 
         // Only process events from the X server
         if data.category != xrecord::XRecordFromServer {
@@ -367,8 +368,8 @@ impl X11InputCapture {
 
         unsafe {
             XQueryPointer(
-                self.display,
-                xlib::XDefaultRootWindow(self.display),
+                self.display.0,
+                xlib::XDefaultRootWindow(self.display.0),
                 &mut root_return,
                 &mut child_return,
                 &mut root_x,
@@ -410,21 +411,21 @@ impl Drop for X11InputCapture {
         // Disable XRecord context
         if self.record_context != 0 {
             unsafe {
-                xrecord::XRecordDisableContext(self.record_display, self.record_context);
-                xrecord::XRecordFreeContext(self.record_display, self.record_context);
+                xrecord::XRecordDisableContext(self.record_display.0, self.record_context);
+                xrecord::XRecordFreeContext(self.record_display.0, self.record_context);
             }
         }
 
         // Close displays
-        if !self.record_display.is_null() {
+        if !self.record_display.0.is_null() {
             unsafe {
-                XCloseDisplay(self.record_display);
+                XCloseDisplay(self.record_display.0);
             }
         }
 
-        if !self.display.is_null() {
+        if !self.display.0.is_null() {
             unsafe {
-                XCloseDisplay(self.display);
+                XCloseDisplay(self.display.0);
             }
         }
 

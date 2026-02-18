@@ -47,10 +47,17 @@ impl X11InputCapture {
     pub fn new() -> Result<Self, X11InputCaptureCreationError> {
         log::info!("Initializing X11 input capture backend");
 
+        // Check DISPLAY environment variable
+        let display_env = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_string());
+        log::info!("Using DISPLAY: {}", display_env);
+
         // Open X11 display
         let display = unsafe {
             match xlib::XOpenDisplay(ptr::null()) {
                 d if ptr::eq(d, ptr::null_mut::<xlib::Display>()) => {
+                    log::error!("Failed to open X11 display. Make sure you're running in an X11 session.");
+                    log::error!("DISPLAY variable is set to: {}", display_env);
+                    log::error!("If you're using Wayland, you may need to run with XWayland or use a Wayland-compatible backend.");
                     return Err(X11InputCaptureCreationError::OpenDisplay);
                 }
                 display => display,
@@ -85,6 +92,9 @@ impl X11InputCapture {
         };
 
         if record_available == 0 {
+            log::error!("XRecord extension is not available on this X server.");
+            log::error!("This extension is required for input capture on X11.");
+            log::error!("Please ensure your X server has the XRecord extension enabled.");
             unsafe {
                 XCloseDisplay(display);
                 XCloseDisplay(record_display);

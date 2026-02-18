@@ -21,9 +21,18 @@ unsafe impl Send for X11Emulation {}
 
 impl X11Emulation {
     pub(crate) fn new() -> Result<Self, X11EmulationCreationError> {
+        log::info!("Initializing X11 input emulation backend");
+
+        // Check DISPLAY environment variable
+        let display_env = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_string());
+        log::info!("Using DISPLAY: {}", display_env);
+
         let display = unsafe {
             match xlib::XOpenDisplay(ptr::null()) {
                 d if std::ptr::eq(d, ptr::null_mut::<xlib::Display>()) => {
+                    log::error!("Failed to open X11 display. Make sure you're running in an X11 session.");
+                    log::error!("DISPLAY variable is set to: {}", display_env);
+                    log::error!("If you're using Wayland, you may need to run with XWayland or use a Wayland-compatible backend.");
                     Err(X11EmulationCreationError::OpenDisplay)
                 }
                 display => Ok(display),

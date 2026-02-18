@@ -15,6 +15,32 @@ pub use error::{CaptureCreationError, CaptureError, InputCaptureError};
 
 pub mod error;
 
+/// Display server type
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DisplayServer {
+    X11,
+    Wayland,
+    Unknown,
+}
+
+/// Detect the active display server type
+fn detect_display_server() -> DisplayServer {
+    // Check for Wayland first (WAYLAND_DISPLAY is set by Wayland compositors)
+    if std::env::var("WAYLAND_DISPLAY").is_ok() {
+        log::info!("Detected Wayland display server");
+        return DisplayServer::Wayland;
+    }
+
+    // Check for X11 (DISPLAY is set by X servers)
+    if std::env::var("DISPLAY").is_ok() {
+        log::info!("Detected X11 display server");
+        return DisplayServer::X11;
+    }
+
+    log::warn!("Unable to detect display server type (neither WAYLAND_DISPLAY nor DISPLAY set)");
+    DisplayServer::Unknown
+}
+
 #[cfg(all(unix, feature = "libei", not(target_os = "macos")))]
 mod libei;
 
@@ -302,7 +328,7 @@ async fn create_backend(
 async fn create(
     backend: Option<Backend>,
 ) -> Result<
-    Box<dyn Capture<Item = Result<(Position, CaptureEvent), CaptureError>>>,
+    Box<dyn Capture<Item = Result<(Position, CaptureEvent), CaptureError>>,
     CaptureCreationError,
 > {
     if let Some(backend) = backend {
@@ -313,18 +339,51 @@ async fn create(
         return b;
     }
 
-    for backend in [
-        #[cfg(all(unix, feature = "libei", not(target_os = "macos")))]
-        Backend::InputCapturePortal,
-        #[cfg(all(unix, feature = "layer_shell", not(target_os = "macos")))]
-        Backend::LayerShell,
-        #[cfg(all(unix, feature = "x11", not(target_os = "macos")))]
-        Backend::X11,
-        #[cfg(windows)]
-        Backend::Windows,
-        #[cfg(target_os = "macos")]
-        Backend::MacOs,
-    ] {
+    // Detect the active display server type
+    let display_server = detect_display_server();
+
+    // Select appropriate backends based on detected display server
+    let backends: Vec<Backend> = match display_server {
+        DisplayServer::Wayland => {
+            log::info!("Wayland detected, trying Wayland-compatible backends first");
+            vec![
+                #[cfg(all(unix, feature = "libei", not(target_os = "macos")))]
+                Backend::InputCapturePortal,
+                #[cfg(all(unix, feature = "layer_shell", not(target_os = "macos")))]
+                Backend::LayerShell,
+                #[cfg(all(unix, feature = "x11", not(target_os = "macos")))]
+                Backend::X11, // Fallback to X11 via XWayland
+            ]
+        }
+        DisplayServer::X11 => {
+            log::info!("X11 detected, trying X11 backend first");
+            vec![
+                #[cfg(all(unix, feature = "x11", not(target_os = "macos")))]
+                Backend::X11,
+                #[cfg(all(unix, feature = "libei", not(target_os = "macos")))]
+                Backend::InputCapturePortal,
+                #[cfg(all(unix, feature = "layer_shell", not(target_os = "macos")))]
+                Backend::LayerShell,
+            ]
+        }
+        DisplayServer::Unknown => {
+            log::warn!("Display server type unknown, trying all available backends");
+            vec![
+                #[cfg(all(unix, feature = "x11", not(target_os = "macos")))]
+                Backend::X11,
+                #[cfg(all(unix, feature = "libei", not(target_os = "macos")))]
+                Backend::InputCapturePortal,
+                #[cfg(all(unix, feature = "layer_shell", not(target_os = "macos")))]
+                Backend::LayerShell,
+                #[cfg(windows)]
+                Backend::Windows,
+                #[cfg(target_os = "macos")]
+                Backend::MacOs,
+            ]
+        }
+    };
+
+    for backend in backends {
         match create_backend(backend).await {
             Ok(b) => {
                 log::info!("using capture backend: {backend}");

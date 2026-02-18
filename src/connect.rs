@@ -57,7 +57,15 @@ async fn connect(
         certificates: vec![cert],
         server_name: "ignored".to_owned(),
         insecure_skip_verify: true,
-        extended_master_secret: ExtendedMasterSecretType::Require,
+        // Change from Require to Request to be more compatible with different implementations
+        extended_master_secret: ExtendedMasterSecretType::Request,
+        // Enable more cipher suites for better compatibility
+        cipher_suites: vec![
+            webrtc_dtls::crypto::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+            webrtc_dtls::crypto::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+            webrtc_dtls::crypto::cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+            webrtc_dtls::crypto::cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+        ],
         ..Default::default()
     };
     let timeout = tokio::time::sleep(DEFAULT_CONNECTION_TIMEOUT);
@@ -65,7 +73,10 @@ async fn connect(
         _ = timeout => Err((addr, LanMouseConnectionError::Timeout)),
         result = DTLSConn::new(conn, config, true, None) => match result {
             Ok(dtls_conn) => Ok((Arc::new(dtls_conn), addr)),
-            Err(e) => Err((addr, e.into())),
+            Err(e) => {
+                log::error!("DTLS handshake failed with {addr}: {e}");
+                Err((addr, e.into()))
+            }
         }
     }
 }

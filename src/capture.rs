@@ -310,9 +310,19 @@ impl CaptureTask {
         let (handle, event) = event;
         log::trace!("({handle}): {event:?}");
 
+        // Check if release bind is pressed
+        log::debug!("handle_capture_event: checking release bind");
         if capture.keys_pressed(&self.release_bind.borrow()) {
             log::info!("releasing capture: release-bind pressed");
             return self.release_capture(capture).await;
+        }
+
+        // Global keyboard handle (u64::MAX) is used only for release bind checking
+        // Skip further processing for this special handle
+        const GLOBAL_KEYBOARD_HANDLE: u64 = u64::MAX;
+        if handle == GLOBAL_KEYBOARD_HANDLE {
+            log::debug!("handle_capture_event: global keyboard handle, skipping further processing");
+            return Ok(());
         }
 
         if event == CaptureEvent::Begin {
@@ -372,6 +382,7 @@ impl CaptureTask {
     }
 
     async fn release_capture(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
+        log::info!("release_capture() called, active_client: {:?}", self.active_client);
         // If we have an active client, notify them we're leaving
         if let Some(handle) = self.active_client.take() {
             log::info!("sending Leave event to client {handle}");
@@ -379,6 +390,7 @@ impl CaptureTask {
                 log::warn!("failed to send Leave to client {handle}: {e}");
             }
         }
+        log::info!("calling capture.release()");
         capture.release().await
     }
 }

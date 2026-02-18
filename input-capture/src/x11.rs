@@ -39,6 +39,15 @@ impl Clone for SendDisplay {
     }
 }
 
+/// Closure data for XRecord callback
+///
+/// This struct holds the data that needs to be passed to the XRecord callback
+/// through the closure parameter.
+struct RecordCallbackClosure {
+    event_tx: mpsc::Sender<Result<(Position, CaptureEvent), CaptureError>>,
+    active_clients: Arc<Mutex<HashSet<Position>>>,
+}
+
 /// X11 input capture backend using XRecord extension
 pub struct X11InputCapture {
     /// X11 display connection
@@ -97,7 +106,7 @@ impl X11InputCapture {
             match xlib::XOpenDisplay(ptr::null()) {
                 d if ptr::eq(d, ptr::null_mut::<xlib::Display>()) => {
                     log::error!("Failed to open X11 display for XRecord");
-                    unsafe { XCloseDisplay(display.0) };
+                    XCloseDisplay(display.0);
                     return Err(X11InputCaptureCreationError::OpenDisplay);
                 }
                 display => SendDisplay(display),
@@ -200,6 +209,12 @@ impl X11InputCapture {
             (*record_range).delivered_events.first = xlib::KeyPress as u8;
             (*record_range).delivered_events.last = xlib::MotionNotify as u8;
 
+            log::debug!(
+                "XRecord range: delivered_events first={} (KeyPress), last={} (MotionNotify)",
+                (*record_range).delivered_events.first,
+                (*record_range).delivered_events.last
+            );
+
             // Create XRecord context
             // XRecordCreateContext signature:
             // XRecordContext XRecordCreateContext(
@@ -228,6 +243,8 @@ impl X11InputCapture {
                 return Err(X11InputCaptureCreationError::XRecordContext);
             }
 
+            log::debug!("XRecord context created successfully: {}", context);
+
             Ok(context)
         }
     }
@@ -238,9 +255,15 @@ impl X11InputCapture {
         context: xrecord::XRecordContext,
         event_tx: mpsc::Sender<Result<(Position, CaptureEvent), CaptureError>>,
         active_clients: Arc<Mutex<HashSet<Position>>>,
-        cursor_pos: Arc<Mutex<(i32, i32)>>,
+        _cursor_pos: Arc<Mutex<(i32, i32)>>,
     ) {
         log::info!("XRecord thread started");
+
+        // Create closure data
+        let closure = RecordCallbackClosure {
+            event_tx,
+            active_clients,
+        };
 
         // Enable XRecord context
         let result = unsafe {
@@ -248,7 +271,7 @@ impl X11InputCapture {
                 display.0,
                 context,
                 Some(Self::record_callback),
-                &event_tx as *const _ as *mut libc::c_char,
+                &closure as *const _ as *mut libc::c_char,
             )
         };
 
@@ -257,18 +280,21 @@ impl X11InputCapture {
             return;
         }
 
-        // Process X11 events
+        log::info!("XRecord context enabled successfully");
+
+        // Process XRecord events using XRecordProcessReplies
+        // This is the correct way to process XRecord events
         loop {
             unsafe {
                 // Check if channel is closed
-                if event_tx.is_closed() {
+                if closure.event_tx.is_closed() {
                     log::info!("XRecord channel closed, stopping thread");
                     break;
                 }
 
-                // Process X11 events
-                let mut event: xlib::XEvent = std::mem::zeroed();
-                xlib::XNextEvent(display.0, &mut event);
+                // Process XRecord replies - this triggers the callback
+                log::trace!("Calling XRecordProcessReplies");
+                xrecord::XRecordProcessReplies(display.0);
             }
         }
 
@@ -282,31 +308,40 @@ impl X11InputCapture {
     ) {
         // Check if intercept_data is null before dereferencing
         if intercept_data.is_null() {
+            log::trace!("XRecord callback: intercept_data is null");
             return;
         }
 
-        let event_tx = &*(closure as *const mpsc::Sender<Result<(Position, CaptureEvent), CaptureError>>);
+        let closure = &*(closure as *const RecordCallbackClosure);
         let data = &*intercept_data;
 
         // Only process events from the X server
         if data.category != xrecord::XRecordFromServer {
+            log::trace!("XRecord callback: category {} is not XRecordFromServer", data.category);
             return;
         }
 
         let event_data = data.data;
         let event_type = *(event_data as *const u8);
 
+        log::trace!("XRecord callback: event_type = {}", event_type);
+
         match event_type as i32 {
             xlib::KeyPress | xlib::KeyRelease => {
-                Self::process_keyboard_event(event_tx, event_data, event_type);
+                log::debug!("XRecord callback: processing keyboard event, type = {}", event_type);
+                Self::process_keyboard_event(&closure.event_tx, event_data, event_type, &closure.active_clients);
             }
             xlib::ButtonPress | xlib::ButtonRelease => {
-                Self::process_button_event(event_tx, event_data, event_type);
+                log::trace!("XRecord callback: processing button event, type = {}", event_type);
+                Self::process_button_event(&closure.event_tx, event_data, event_type);
             }
             xlib::MotionNotify => {
-                Self::process_motion_event(event_tx, event_data);
+                log::trace!("XRecord callback: processing motion event");
+                Self::process_motion_event(&closure.event_tx, event_data);
             }
-            _ => {}
+            _ => {
+                log::trace!("XRecord callback: unknown event type {}", event_type);
+            }
         }
     }
 
@@ -315,6 +350,7 @@ impl X11InputCapture {
         event_tx: &mpsc::Sender<Result<(Position, CaptureEvent), CaptureError>>,
         event_data: *const u8,
         event_type: u8,
+        active_clients: &Arc<Mutex<HashSet<Position>>>,
     ) {
         let keycode = *(event_data.offset(1) as *const u8);
         let state = if event_type as i32 == xlib::KeyPress { 1 } else { 0 };
@@ -322,15 +358,40 @@ impl X11InputCapture {
         // X11 keycodes are shifted by 8 relative to Linux scancodes
         let linux_scancode = (keycode as u32) - 8;
 
+        log::debug!(
+            "X11: Keyboard event - keycode: {}, linux_scancode: {}, state: {}",
+            keycode,
+            linux_scancode,
+            if state == 1 { "pressed" } else { "released" }
+        );
+
         let event = Event::Keyboard(KeyboardEvent::Key {
             time: 0,
             key: linux_scancode,
             state,
         });
 
-        // Send event (position will be determined by edge detection)
-        // For now, we send to Left as placeholder
-        let _ = event_tx.try_send(Ok((Position::Left, CaptureEvent::Input(event))));
+        // Send keyboard events to all active capture positions
+        // This ensures the release bind can be detected regardless of which
+        // position has an active capture
+        if let Ok(clients) = active_clients.try_lock() {
+            if clients.is_empty() {
+                log::debug!("X11: No active captures, sending keyboard event to Left as placeholder");
+                // If no active captures, send to Left as placeholder
+                // This ensures pressed_keys is still updated
+                let _ = event_tx.try_send(Ok((Position::Left, CaptureEvent::Input(event.clone()))));
+            } else {
+                log::debug!("X11: Active captures at positions: {:?}", clients);
+                // Send to all active capture positions
+                for &position in clients.iter() {
+                    let _ = event_tx.try_send(Ok((position, CaptureEvent::Input(event.clone()))));
+                }
+            }
+        } else {
+            log::debug!("X11: Failed to lock active_clients, sending keyboard event to Left as placeholder");
+            // If lock fails, send to Left as placeholder
+            let _ = event_tx.try_send(Ok((Position::Left, CaptureEvent::Input(event))));
+        }
     }
 
     /// Process mouse button events
@@ -348,6 +409,8 @@ impl X11InputCapture {
             state,
         });
 
+        // Send event (position will be determined by edge detection)
+        // For now, we send to Left as placeholder
         let _ = event_tx.try_send(Ok((Position::Left, CaptureEvent::Input(event))));
     }
 
@@ -365,6 +428,8 @@ impl X11InputCapture {
             dy: y as f64,
         });
 
+        // Send event (position will be determined by edge detection)
+        // For now, we send to Left as placeholder
         let _ = event_tx.try_send(Ok((Position::Left, CaptureEvent::Input(event))));
     }
 

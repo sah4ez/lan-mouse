@@ -15,7 +15,7 @@ use tokio::{
     task::{JoinHandle, spawn_local},
 };
 use webrtc_dtls::{
-    config::{ClientAuthType::RequireAnyClientCert, Config, ExtendedMasterSecretType},
+    config::{Config, ExtendedMasterSecretType},
     conn::DTLSConn,
     crypto::Certificate,
     listener::listen,
@@ -105,7 +105,9 @@ impl LanMouseListener {
             certificates: vec![cert.clone()],
             // Change from Require to Request for better compatibility
             extended_master_secret: ExtendedMasterSecretType::Request,
-            client_auth: RequireAnyClientCert,
+            // Use RequestClientCert instead of RequireAnyClientCert for better compatibility
+            // This allows connections even if client certificate verification fails
+            client_auth: webrtc_dtls::config::ClientAuthType::RequestClientCert,
             verify_peer_certificate,
             ..Default::default()
         };

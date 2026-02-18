@@ -57,8 +57,10 @@ async fn connect(
         certificates: vec![cert],
         server_name: "ignored".to_owned(),
         insecure_skip_verify: true,
-        // Change from Require to Request to be more compatible with different implementations
+        // Use Request instead of Require for better compatibility with different DTLS implementations
         extended_master_secret: ExtendedMasterSecretType::Request,
+        // Request client certificate from server (server may or may not require it)
+        client_auth: webrtc_dtls::config::ClientAuthType::RequestClientCert,
         ..Default::default()
     };
     let timeout = tokio::time::sleep(DEFAULT_CONNECTION_TIMEOUT);
@@ -68,6 +70,16 @@ async fn connect(
             Ok(dtls_conn) => Ok((Arc::new(dtls_conn), addr)),
             Err(e) => {
                 log::error!("DTLS handshake failed with {addr}: {e}");
+                log::error!("This may be due to:");
+                log::error!("  - Network connectivity issues (firewall, NAT)");
+                log::error!("  - DTLS version or cipher suite mismatch");
+                log::error!("  - Certificate validation issues");
+                log::error!("  - The remote device may not be running or may have a different version");
+                log::error!("Try:");
+                log::error!("  - Check if the remote device is running lan-mouse");
+                log::error!("  - Verify network connectivity (ping {addr})");
+                log::error!("  - Check firewall settings");
+                log::error!("  - Ensure both devices are running compatible versions");
                 Err((addr, e.into()))
             }
         }

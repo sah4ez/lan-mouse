@@ -14,11 +14,17 @@ This document provides comprehensive instructions for building the lan-mouse pro
 ### Local Build (Current Platform)
 
 ```bash
-# Build without default features (recommended for cross-platform compatibility)
-cargo build --no-default-features --release
+# Build with default features (recommended - includes platform-specific backends)
+cargo build --release
 
-# Build with specific features
+# Build with specific features (for X11 on Linux)
 cargo build --release --features x11_capture,x11_emulation
+
+# Build with specific features (for Wayland on Linux)
+cargo build --release --features layer_shell_capture,wlroots_emulation
+
+# Build without default features (minimal build, no GUI)
+cargo build --no-default-features --release
 ```
 
 ### Cross-Platform Build
@@ -63,8 +69,8 @@ brew install gtk4 libadwaita imagemagick
 # Install target
 rustup target add aarch64-apple-darwin
 
-# Build
-cargo build --no-default-features --release --target aarch64-apple-darwin
+# Build with default features (recommended)
+cargo build --release --target aarch64-apple-darwin
 ```
 
 #### Building for Intel
@@ -73,16 +79,16 @@ cargo build --no-default-features --release --target aarch64-apple-darwin
 # Install target
 rustup target add x86_64-apple-darwin
 
-# Build
-cargo build --no-default-features --release --target x86_64-apple-darwin
+# Build with default features (recommended)
+cargo build --release --target x86_64-apple-darwin
 ```
 
 #### Universal Binary
 
 ```bash
 # Build both architectures
-cargo build --no-default-features --release --target aarch64-apple-darwin
-cargo build --no-default-features --release --target x86_64-apple-darwin
+cargo build --release --target aarch64-apple-darwin
+cargo build --release --target x86_64-apple-darwin
 
 # Create universal binary
 lipo -create -output target/release/lan-mouse-universal \
@@ -121,8 +127,11 @@ sudo dnf install -y \
 # Install target
 rustup target add x86_64-unknown-linux-gnu
 
-# Build
-cargo build --no-default-features --release --target x86_64-unknown-linux-gnu
+# Build with default features (includes X11 and Wayland backends)
+cargo build --release --target x86_64-unknown-linux-gnu
+
+# Or build with X11-specific features
+cargo build --release --features x11_capture,x11_emulation --target x86_64-unknown-linux-gnu
 ```
 
 #### Building for ARM64
@@ -134,8 +143,11 @@ rustup target add aarch64-unknown-linux-gnu
 # Install cross-compilation tools
 sudo apt-get install gcc-aarch64-linux-gnu
 
-# Build
-cargo build --no-default-features --release --target aarch64-unknown-linux-gnu
+# Build with default features (includes X11 and Wayland backends)
+cargo build --release --target aarch64-unknown-linux-gnu
+
+# Or build with X11-specific features
+cargo build --release --features x11_capture,x11_emulation --target aarch64-unknown-linux-gnu
 ```
 
 ### Cross-Compilation from macOS to Linux
@@ -152,8 +164,8 @@ export CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
 export AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc-ar
 export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
 
-# Build
-cargo build --no-default-features --release --target aarch64-unknown-linux-gnu
+# Build with default features (includes X11 and Wayland backends)
+cargo build --release --target aarch64-unknown-linux-gnu
 ```
 
 ## Build Validation
@@ -278,6 +290,82 @@ sudo apt-get install libx11-dev libxtst-dev
 sudo dnf install libX11-devel libXtst-devel
 ```
 
+#### Issue: "No input capture backend available" or "No input emulation backend available"
+
+**Error:**
+```
+[ERROR input_capture] No input capture backend available. Tried: []
+[ERROR input_emulation] No input emulation backend available. Tried: []
+```
+
+**Solution:** This error occurs when the binary was built without the necessary backend features. Rebuild with appropriate features for your platform:
+
+```bash
+# For X11 on Linux
+cargo build --release --features x11_capture,x11_emulation
+
+# For Wayland on Linux
+cargo build --release --features layer_shell_capture,wlroots_emulation
+
+# For macOS (includes macOS backend automatically)
+cargo build --release
+
+# For Windows (includes Windows backend automatically)
+cargo build --release
+
+# Or build with all default features (recommended)
+cargo build --release
+```
+
+**Note:** The default build (`cargo build --release`) includes all platform-specific backends and is the recommended approach.
+
+#### Issue: DTLS handshake failed with "Alert is Fatal or Close Notify"
+
+**Error:**
+```
+[ERROR lan_mouse::connect] DTLS handshake failed with 15.1.30.94:4242: Alert is Fatal or Close Notify
+[WARN lan_mouse::connect] failed to connect to 15.1.30.94:4242: `Alert is Fatal or Close Notify`
+```
+
+**Solution:** This error indicates a DTLS handshake failure between the client and server. Common causes and solutions:
+
+1. **Network connectivity issues:**
+   ```bash
+   # Check if the remote device is reachable
+   ping 15.1.30.94
+
+   # Check if the port is open
+   nc -zv 15.1.30.94 4242
+   ```
+
+2. **Firewall blocking the connection:**
+   - Ensure UDP port 4242 (or your configured port) is open in the firewall
+   - Check both client and server firewall settings
+
+3. **Remote device not running lan-mouse:**
+   - Verify that lan-mouse is running on the remote device
+   - Check that the daemon is started: `lan-mouse daemon`
+
+4. **Version mismatch:**
+   - Ensure both devices are running compatible versions of lan-mouse
+   - Try updating to the latest version on both devices
+
+5. **Certificate issues:**
+   - Remove old certificates and let lan-mouse regenerate them:
+     ```bash
+     rm ~/.config/lan-mouse/cert.pem
+     # Restart lan-mouse to regenerate the certificate
+     ```
+
+6. **NAT/port forwarding issues:**
+   - If connecting over the internet, ensure proper port forwarding is configured
+   - Check if both devices are on the same network or if VPN is needed
+
+**Debugging tips:**
+- Run with debug logging: `RUST_LOG=debug lan-mouse daemon`
+- Check the logs for more detailed error messages
+- Try connecting from a different device to isolate the issue
+
 ## Build Artifacts
 
 After building, binaries are located in:
@@ -311,6 +399,13 @@ This produces optimized, stripped binaries with minimal size.
 For development builds with debug information:
 
 ```bash
+# Build with default features (recommended for development)
+cargo build
+
+# Build with specific features
+cargo build --features x11_capture,x11_emulation
+
+# Build without default features (minimal build)
 cargo build --no-default-features
 ```
 
@@ -318,6 +413,8 @@ Debug builds are located in:
 ```
 target/<target-triple>/debug/lan-mouse
 ```
+
+**Important:** Always build with appropriate features for your platform. Building without features (`--no-default-features`) will result in a minimal binary without input capture/emulation backends, which will not function properly.
 
 ## Additional Resources
 

@@ -30,6 +30,15 @@ struct SendDisplay(*mut xlib::Display);
 // used in a single thread at a time.
 unsafe impl Send for SendDisplay {}
 
+// SAFETY: Cloning creates a new reference to the same display pointer.
+// This is safe as long as each clone is used in a separate thread and the display
+// is properly closed only once.
+impl Clone for SendDisplay {
+    fn clone(&self) -> Self {
+        Self(self.0)
+    }
+}
+
 /// X11 input capture backend using XRecord extension
 pub struct X11InputCapture {
     /// X11 display connection
@@ -145,12 +154,15 @@ impl X11InputCapture {
         let active_clients_clone = Arc::clone(&active_clients);
         let cursor_pos_clone = Arc::clone(&cursor_pos);
 
+        // Clone record_display for the thread
+        let record_display_clone = record_display.clone();
+        
         // Start XRecord thread
         log::debug!("Starting XRecord thread");
         let record_thread = thread::spawn(move || {
             log::info!("XRecord thread started");
             Self::run_record_callback(
-                record_display,
+                record_display_clone,
                 record_context,
                 event_tx,
                 active_clients_clone,
@@ -236,7 +248,7 @@ impl X11InputCapture {
                 display.0,
                 context,
                 Some(Self::record_callback),
-                &event_tx as *const _ as *mut u8,
+                &event_tx as *const _ as *mut libc::c_char,
             )
         };
 
@@ -265,7 +277,7 @@ impl X11InputCapture {
 
     /// XRecord callback function
     unsafe extern "C" fn record_callback(
-        closure: *mut libc::c_void,
+        closure: *mut libc::c_char,
         intercept_data: *mut XRecordInterceptData,
     ) {
         // Check if intercept_data is null before dereferencing

@@ -4,7 +4,7 @@ This document summarizes the bug fixes implemented for the lan-mouse project.
 
 ## Issues Fixed
 
-### Issue 1: No Input Capture/Emulation Backend Available
+### Issue 1: No Input Capture/Emulation Backend Available (Documentation)
 
 **Error:**
 ```
@@ -67,6 +67,41 @@ The DTLS configuration was too strict, requiring client certificates on the serv
 
 ---
 
+### Issue 3: X11 Backend Compilation Errors
+
+**Error:**
+```
+error[E0277]: `*mut _XDisplay` cannot be sent between threads safely
+error[E0609]: no field `core_events` on type `XRecordRange`
+error[E0061]: this function takes 6 arguments but 4 arguments were supplied
+error[E0433]: failed to resolve: use of unresolved module or unlinked crate `libc`
+error[E0308]: mismatched types
+```
+
+**Root Cause:**
+The X11 backend code had multiple compilation errors:
+1. Unused imports causing warnings
+2. Incorrect field names in XRecordRange struct
+3. Incorrect function signature for XRecordCreateContext
+4. Missing libc dependency for unix targets
+5. Type mismatches in event processing
+
+**Fix:**
+1. Removed unused imports in [`input-capture/src/x11.rs`](input-capture/src/x11.rs:1-18)
+2. Fixed XRecordRange field names from `core_events` to `delivered_events`
+3. Fixed XRecordCreateContext function call with correct 6 parameters
+4. Added libc dependency to [`input-capture/Cargo.toml`](input-capture/Cargo.toml:48) for unix targets
+5. Fixed type mismatches by casting event_type to i32 and dx/dy to f64
+6. Added unsafe impl Sync for X11InputCapture to handle thread safety
+
+**Files Modified:**
+- `input-capture/src/x11.rs` - Fixed all compilation errors
+- `input-capture/Cargo.toml` - Added libc dependency
+
+**Commit:** `978774f` - "Fix: Resolve X11 backend compilation errors"
+
+---
+
 ## Testing
 
 ### Build Verification
@@ -95,6 +130,12 @@ The following tests should be performed by users:
 - Enhanced DTLS handshake error messages with actionable suggestions
 - Added detailed logging for connection failures
 - Provided specific troubleshooting steps in error messages
+
+### Code Quality
+- Fixed X11 backend compilation errors
+- Removed unused imports and dead code
+- Improved type safety with proper casts
+- Added missing dependencies for unix targets
 
 ---
 

@@ -12,7 +12,6 @@ use core_graphics::event::{
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use input_event::{BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent, PointerEvent, scancode};
 use keycode::{KeyMap, KeyMapping};
-use lan_mouse_ipc::Position as IpcPosition;
 use std::cell::Cell;
 use std::ops::{Index, IndexMut};
 use std::rc::Rc;

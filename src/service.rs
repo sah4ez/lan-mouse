@@ -20,8 +20,6 @@ use std::{
     io,
     net::{IpAddr, SocketAddr},
     sync::{Arc, RwLock},
-    time::Duration,
-    thread,
 };
 use thiserror::Error;
 use tokio::{process::Command, signal, sync::Notify};
@@ -99,6 +97,7 @@ struct Incoming {
 }
 
 /// Edge crossing event from cursor tracking thread
+#[cfg(target_os = "linux")]
 #[derive(Debug, Clone)]
 struct EdgeCrossingEvent {
     addr: SocketAddr,
@@ -514,10 +513,11 @@ impl Service {
             EmulationEvent::Connected { addr, fingerprint } => {
                 self.notify_frontend(FrontendEvent::DeviceConnected { addr, fingerprint });
             }
+            #[cfg(target_os = "linux")]
             EmulationEvent::EdgeCrossed { addr, pos } => {
                 log::info!("cursor crossed edge at position {:?} for connection {}", pos, addr);
                 // Send Enter event to the remote machine to notify that cursor is returning
-                if let Some(incoming) = self.incoming_conn_info.values().find(|i| i.addr == addr) {
+                if let Some(_incoming) = self.incoming_conn_info.values().find(|i| i.addr == addr) {
                     log::info!("sending Enter event to remote machine at position {:?}", pos);
                     self.emulation.send_enter_event(addr, pos);
                 }

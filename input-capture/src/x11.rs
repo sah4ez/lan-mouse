@@ -2,20 +2,19 @@ use std::{
     collections::HashSet,
     ptr,
     sync::Arc,
-    task::{Context, Poll},
+    task::Poll,
     thread,
-    time::Duration,
 };
 
 use async_trait::async_trait;
 use futures_core::Stream;
 use tokio::sync::{mpsc, Mutex};
 use x11::{
-    xlib::{self, XCloseDisplay, XDisplayHeight, XDisplayWidth, XFlush, XQueryPointer},
-    xrecord::{self, XRecordClientInfo, XRecordInterceptData},
+    xlib::{self, XCloseDisplay, XDisplayHeight, XDisplayWidth, XQueryPointer},
+    xrecord::{self, XRecordInterceptData},
 };
 
-use input_event::{Event, KeyboardEvent, PointerEvent, scancode};
+use input_event::{Event, KeyboardEvent, PointerEvent};
 
 use super::{Capture, CaptureError, CaptureEvent, Position, error::X11InputCaptureCreationError};
 
@@ -40,7 +39,11 @@ pub struct X11InputCapture {
     record_thread: Option<thread::JoinHandle<()>>,
 }
 
+// X11 display pointers are not thread-safe, but we need to send them across threads
+// for the XRecord callback. We use unsafe to implement Send, but we must ensure
+// proper synchronization.
 unsafe impl Send for X11InputCapture {}
+unsafe impl Sync for X11InputCapture {}
 
 impl X11InputCapture {
     /// Create a new X11 input capture instance
@@ -176,18 +179,29 @@ impl X11InputCapture {
             }
 
             // Set up range to capture all input events
-            (*record_range).core_events.first = xlib::KeyPress as u8;
-            (*record_range).core_events.last = xlib::MotionNotify as u8;
+            (*record_range).delivered_events.first = xlib::KeyPress as u8;
+            (*record_range).delivered_events.last = xlib::MotionNotify as u8;
 
             // Create XRecord context
-            // Note: XRecordCreateContext expects a pointer to an array of XRecordRange pointers
-            // We need to create an array of pointers, not just pass the range pointer directly
+            // XRecordCreateContext signature:
+            // XRecordContext XRecordCreateContext(
+            //     Display *display,
+            //     int intercept_client,
+            //     XRecordClientSpec *clients,
+            //     int nclients,
+            //     XRecordRange *ranges,
+            //     int nranges,
+            //     XRecordInterceptProc intercept_proc
+            // );
             let mut ranges: [*mut xrecord::XRecordRange; 1] = [record_range];
             let context = xrecord::XRecordCreateContext(
                 display,
                 0, // XRecordAllClients
+                ptr::null_mut(), // clients (NULL for all clients)
+                0, // nclients
                 ranges.as_mut_ptr(),
-                1,
+                1, // nranges
+                ptr::null_mut(), // intercept_proc (NULL for default)
             );
 
             // Free the range
@@ -287,7 +301,7 @@ impl X11InputCapture {
         event_type: u8,
     ) {
         let keycode = *(event_data.offset(1) as *const u8);
-        let state = if event_type == xlib::KeyPress { 1 } else { 0 };
+        let state = if event_type as i32 == xlib::KeyPress { 1 } else { 0 };
 
         // X11 keycodes are shifted by 8 relative to Linux scancodes
         let linux_scancode = (keycode as u32) - 8;
@@ -310,7 +324,7 @@ impl X11InputCapture {
         event_type: u8,
     ) {
         let button = *(event_data.offset(1) as *const u8);
-        let state = if event_type == xlib::ButtonPress { 1 } else { 0 };
+        let state = if event_type as i32 == xlib::ButtonPress { 1 } else { 0 };
 
         let event = Event::Pointer(PointerEvent::Button {
             time: 0,
@@ -331,8 +345,8 @@ impl X11InputCapture {
 
         let event = Event::Pointer(PointerEvent::Motion {
             time: 0,
-            dx: x,
-            dy: y,
+            dx: x as f64,
+            dy: y as f64,
         });
 
         let _ = event_tx.try_send(Ok((Position::Left, CaptureEvent::Input(event))));

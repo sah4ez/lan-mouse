@@ -1,10 +1,11 @@
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use input_capture::{
     CaptureError, CaptureEvent, CaptureHandle, InputCapture, InputCaptureError, Position,
 };
@@ -72,6 +73,7 @@ impl Capture {
         let cancellation_token = CancellationToken::new();
         let capture_task = CaptureTask {
             active_client: None,
+            incoming_client: None, // Track the client that's sending events TO us
             backend,
             cancellation_token: cancellation_token.clone(),
             captures: Default::default(),
@@ -80,6 +82,7 @@ impl Capture {
             request_rx,
             release_bind: Rc::new(RefCell::new(release_bind)),
             state: Default::default(),
+            prevent_capture_recreation: false,
         };
         let task = spawn_local(capture_task.run());
         Self {
@@ -152,6 +155,7 @@ macro_rules! debounce {
 
 struct CaptureTask {
     active_client: Option<CaptureHandle>,
+    incoming_client: Option<CaptureHandle>, // Track the client that's sending events TO us
     backend: Option<input_capture::Backend>,
     cancellation_token: CancellationToken,
     captures: Vec<(CaptureHandle, Position, CaptureType)>,
@@ -160,6 +164,8 @@ struct CaptureTask {
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
     request_rx: Receiver<CaptureRequest>,
     state: State,
+    /// Flag to prevent capture recreation when a client has just entered the device
+    prevent_capture_recreation: bool,
 }
 
 impl CaptureTask {
@@ -226,11 +232,15 @@ impl CaptureTask {
         );
 
         /* create barriers for active clients */
-        let r = self.create_captures(&mut capture).await;
-        if let Err(e) = r {
-            capture.terminate().await?;
-            return Err(e.into());
+        /* prevent capture recreation when a client has just entered the device */
+        if !self.prevent_capture_recreation {
+            let r = self.create_captures(&mut capture).await;
+            if let Err(e) = r {
+                capture.terminate().await?;
+                return Err(e.into());
+            }
         }
+        self.prevent_capture_recreation = false;
 
         let r = self.do_capture_session(&mut capture).await;
 
@@ -242,12 +252,15 @@ impl CaptureTask {
 
     async fn create_captures(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
         let captures = self.captures.clone();
+        log::debug!("creating {} capture barriers", captures.len());
         for (handle, pos, _type) in captures {
+            log::debug!("creating capture barrier: handle={handle}, pos={pos:?}, type={_type:?}");
             tokio::select! {
                 r = capture.create(handle, pos) => r?,
                 _ = self.cancellation_token.cancelled() => return Ok(()),
             }
         }
+        log::debug!("all capture barriers created successfully");
         Ok(())
     }
 
@@ -255,11 +268,26 @@ impl CaptureTask {
         &mut self,
         capture: &mut InputCapture,
     ) -> Result<(), InputCaptureError> {
+        log::debug!("starting capture session, state: {:?}, active_client: {:?}", self.state, self.active_client);
+        log::debug!("active captures: {:?}", self.captures);
+
+        // Create a timer to periodically poll for edge detection
+        // This ensures edge detection works even when there are no XRecord events
+        // (e.g., when cursor is being emulated by remote client)
+        let mut edge_check_interval = tokio::time::interval(tokio::time::Duration::from_millis(10));
+
         loop {
             tokio::select! {
                 event = capture.next() => match event {
-                    Some(event) => self.handle_capture_event(capture, event?).await?,
-                    None => return Ok(()),
+                    Some(event) => {
+                        let event = event?;
+                        log::trace!("capture event received: handle={}, event={:?}", event.0, event.1);
+                        self.handle_capture_event(capture, event).await?
+                    },
+                    None => {
+                        log::debug!("capture stream ended");
+                        return Ok(())
+                    },
                 },
                 (handle, event) = self.conn.recv() => {
                     if let Some(active) = self.active_client {
@@ -280,20 +308,38 @@ impl CaptureTask {
                         ProtoEvent::Leave(_) => {
                             log::info!("releasing capture: left remote client device region");
                             self.release_capture(capture).await?;
+                            // Reset state to WaitingForAck when client disconnects
+                            self.state = State::WaitingForAck;
                         },
                         _ => {}
                     }
                 },
                 e = self.request_rx.recv() => match e.expect("channel closed") {
-                    CaptureRequest::Reenable => { /* already active */ },
-                    CaptureRequest::Release => self.release_capture(capture).await?,
+                    CaptureRequest::Reenable => { log::debug!("reenable request received (already active)"); },
+                    CaptureRequest::Release => {
+                        log::debug!("release request received");
+                        self.release_capture(capture).await?
+                    },
                     CaptureRequest::Create(h, p, t) => {
+                        log::debug!("create capture request: handle={h}, pos={p:?}, type={t:?}");
                         self.add_capture(h, p, t);
                         capture.create(h, p).await?;
                     }
                     CaptureRequest::Destroy(h) => {
+                        log::debug!("destroy capture request: handle={h}");
                         self.remove_capture(h);
                         capture.destroy(h).await?;
+                    }
+                },
+                _ = edge_check_interval.tick() => {
+                    // Periodically poll the capture stream for edge detection
+                    // This is needed because XRecord only generates events for real input,
+                    // not for emulated cursor movement
+                    if let Poll::Ready(Some(event)) = Pin::new(&mut *capture).poll_next(&mut Context::from_waker(futures::task::noop_waker_ref())) {
+                        if let Ok((pos, event)) = event {
+                            log::trace!("periodic edge check: handle={}, event={:?}", pos, event);
+                            self.handle_capture_event(capture, (pos, event)).await?;
+                        }
                     }
                 },
                 _ = self.cancellation_token.cancelled() => break,
@@ -308,10 +354,11 @@ impl CaptureTask {
         event: (CaptureHandle, CaptureEvent),
     ) -> Result<(), CaptureError> {
         let (handle, event) = event;
-        log::trace!("({handle}): {event:?}");
+        let capture_type = self.captures.iter().find(|(h, _, _)| *h == handle).map(|(_, _, t)| t);
+        log::debug!("handle_capture_event: handle={handle}, event={event:?}, type={capture_type:?}, state={:?}, active_client={:?}",
+            self.state, self.active_client);
 
         // Check if release bind is pressed
-        log::debug!("handle_capture_event: checking release bind");
         if capture.keys_pressed(&self.release_bind.borrow()) {
             log::info!("releasing capture: release-bind pressed");
             return self.release_capture(capture).await;
@@ -321,11 +368,14 @@ impl CaptureTask {
         // Skip further processing for this special handle
         const GLOBAL_KEYBOARD_HANDLE: u64 = u64::MAX;
         if handle == GLOBAL_KEYBOARD_HANDLE {
-            log::debug!("handle_capture_event: global keyboard handle, skipping further processing");
+            log::trace!("global keyboard handle, skipping further processing");
             return Ok(());
         }
 
         if event == CaptureEvent::Begin {
+            let pos = self.get_pos(handle);
+            let cap_type = self.get_type(handle);
+            log::info!("cursor reached screen edge: {pos:?} (handle: {handle}, type: {cap_type:?})");
             self.event_tx
                 .send(ICaptureEvent::CaptureBegin(handle))
                 .expect("channel closed");
@@ -333,10 +383,14 @@ impl CaptureTask {
 
         // enter only capture (for incoming connections)
         if self.get_type(handle) == CaptureType::EnterOnly {
+            // This is an incoming connection - track it
+            self.incoming_client = Some(handle);
+            log::info!("set incoming_client: {:?}", handle);
             // if there is no active outgoing connection at the current capture,
             // we release the capture
             if !self.is_default_capture_at(self.get_pos(handle)) {
                 log::info!("releasing capture: no active client at this position");
+                self.prevent_capture_recreation = true;
                 capture.release().await?;
             }
             // we dont care about events from incoming handles except for releasing the capture
@@ -344,22 +398,50 @@ impl CaptureTask {
         }
 
         // activated a new client
-        if event == CaptureEvent::Begin && Some(handle) != self.active_client {
-            self.state = State::WaitingForAck;
-            self.active_client.replace(handle);
-            self.event_tx
-                .send(ICaptureEvent::ClientEntered(handle))
-                .expect("channel closed");
+        if event == CaptureEvent::Begin {
+            if Some(handle) != self.active_client {
+                log::info!("activating new client: handle={handle}, state transition: {:?} -> WaitingForAck", self.state);
+                self.state = State::WaitingForAck;
+                self.active_client.replace(handle);
+                self.event_tx
+                    .send(ICaptureEvent::ClientEntered(handle))
+                    .expect("channel closed");
+            } else {
+                // Same client re-entering - keep current state
+                log::debug!("client {handle} re-entered, keeping current state: {:?}", self.state);
+            }
         }
 
         let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
 
+        // Determine if we should send Enter or Leave event
+        // If we're currently sending input events to a client (state is Sending),
+        // and the cursor crosses back towards that client, we should send Leave
+        // to tell the client to stop sending input events.
+        // Otherwise, we send Enter to tell the client to start sending events.
         let event = match event {
-            CaptureEvent::Begin => ProtoEvent::Enter(opposite_pos),
+            CaptureEvent::Begin => {
+                if self.state == State::Sending && Some(handle) == self.active_client {
+                    // We're sending events to this client and cursor is returning to it
+                    // Send Leave to tell client to stop sending events
+                    log::info!("cursor returning to client {handle}, sending Leave event");
+                    ProtoEvent::Leave(0)
+                } else {
+                    // Cursor is entering client's region
+                    log::info!("cursor entering client {handle} region at position: {opposite_pos:?}");
+                    ProtoEvent::Enter(opposite_pos)
+                }
+            }
             CaptureEvent::Input(e) => match self.state {
                 // connection not acknowledged, repeat `Enter` event
-                State::WaitingForAck => ProtoEvent::Enter(opposite_pos),
-                State::Sending => ProtoEvent::Input(e),
+                State::WaitingForAck => {
+                    log::debug!("waiting for ack from client {handle}, sending Enter event");
+                    ProtoEvent::Enter(opposite_pos)
+                }
+                State::Sending => {
+                    log::trace!("sending input event to client {handle}");
+                    ProtoEvent::Input(e)
+                }
             },
         };
 
@@ -382,7 +464,7 @@ impl CaptureTask {
     }
 
     async fn release_capture(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
-        log::info!("release_capture() called, active_client: {:?}", self.active_client);
+        log::info!("release_capture() called, active_client: {:?}, state: {:?}", self.active_client, self.state);
         // If we have an active client, notify them we're leaving
         if let Some(handle) = self.active_client.take() {
             log::info!("sending Leave event to client {handle}");
@@ -390,7 +472,9 @@ impl CaptureTask {
                 log::warn!("failed to send Leave to client {handle}: {e}");
             }
         }
-        log::info!("calling capture.release()");
+        // Reset state to WaitingForAck when capture is released
+        self.state = State::WaitingForAck;
+        log::info!("calling capture.release(), state reset to WaitingForAck");
         capture.release().await
     }
 }

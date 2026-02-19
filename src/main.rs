@@ -42,7 +42,9 @@ enum LanMouseError {
 
 fn main() {
     // init logging
-    let env = Env::default().filter_or("LAN_MOUSE_LOG_LEVEL", "info");
+    // Default to trace level for detailed cursor position tracking
+    // Can be overridden with LAN_MOUSE_LOG_LEVEL environment variable
+    let env = Env::default().filter_or("LAN_MOUSE_LOG_LEVEL", "trace");
     env_logger::init_from_env(env);
 
     if let Err(e) = run() {

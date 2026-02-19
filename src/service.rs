@@ -261,6 +261,11 @@ impl Service {
         while let Some(event) = self.pending_frontend_events.pop_front() {
             self.frontend_listener.broadcast(event).await;
         }
+        // Ensure status consistency after sending events
+        if self.capture_status == Status::Enabled && self.emulation_status != Status::Enabled {
+            log::debug!("capture enabled but emulation disabled, reenabling emulation");
+            self.emulation.reenable();
+        }
     }
 
     fn handle_emulation_event(&mut self, event: EmulationEvent) {
@@ -331,8 +336,13 @@ impl Service {
                 self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status));
             }
             ICaptureEvent::ClientEntered(handle) => {
-                log::info!("entering client {handle} ...");
+                log::info!("cursor entered client {handle} zone");
                 self.spawn_hook_command(handle);
+                // Ensure emulation is enabled when we enter a client
+                if self.emulation_status != Status::Enabled {
+                    log::debug!("ensuring emulation is enabled when entering client");
+                    self.emulation.reenable();
+                }
             }
         }
     }
@@ -473,6 +483,11 @@ impl Service {
         log::debug!("deactivating client {handle}");
         if self.client_manager.deactivate_client(handle) {
             self.capture.destroy(handle);
+            // Ensure capture is reenabled after deactivating a client
+            if self.capture_status == Status::Disabled {
+                log::debug!("reenabling capture after client deactivation");
+                self.capture.reenable();
+            }
             self.broadcast_client(handle);
             log::info!("deactivated client {handle}");
         }
@@ -497,6 +512,7 @@ impl Service {
 
         /* activate the client */
         if self.client_manager.activate_client(handle) {
+            log::info!("activated client {handle} at position: {:?}", self.client_manager.get_pos(handle));
             /* notify capture and frontends */
             self.capture.create(handle, pos, CaptureType::Default);
             self.broadcast_client(handle);

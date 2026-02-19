@@ -1681,6 +1681,7 @@ dependencies = [
  "memmap",
  "once_cell",
  "reis",
+ "scopeguard",
  "tempfile",
  "thiserror 2.0.12",
  "tokio",

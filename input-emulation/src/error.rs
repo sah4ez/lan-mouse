@@ -41,6 +41,8 @@ pub enum EmulationError {
     Ashpd(#[from] ashpd::Error),
     #[error("io error: `{0}`")]
     Io(#[from] io::Error),
+    #[error("emulation error: {0}")]
+    Other(String),
 }
 
 #[derive(Debug, Error)]
@@ -145,8 +147,10 @@ pub enum XdpEmulationCreationError {
 #[cfg(all(unix, feature = "x11", not(target_os = "macos")))]
 #[derive(Debug, Error)]
 pub enum X11EmulationCreationError {
-    #[error("could not open display")]
-    OpenDisplay,
+    #[error("could not open display: {display}")]
+    OpenDisplay { display: String },
+    #[error("X11 emulation error: {message}")]
+    Other { message: String },
 }
 
 #[cfg(target_os = "macos")]

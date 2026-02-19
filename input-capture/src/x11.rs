@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
     ptr,
+    sync::atomic::{AtomicBool, AtomicPtr, Ordering},
     sync::Arc,
     task::Poll,
     thread,
@@ -10,7 +11,7 @@ use async_trait::async_trait;
 use futures_core::Stream;
 use tokio::sync::{mpsc, Mutex};
 use x11::{
-    xlib::{self, XCloseDisplay, XDisplayHeight, XDisplayWidth, XQueryPointer},
+    xlib::{self, XCloseDisplay, XDisplayHeight, XDisplayWidth, XQueryPointer, XWarpPointer, XDefaultRootWindow, XFlush},
     xrecord::{self, XRecordInterceptData},
 };
 
@@ -18,26 +19,96 @@ use input_event::{Event, KeyboardEvent, PointerEvent};
 
 use super::{Capture, CaptureError, CaptureEvent, Position, error::X11InputCaptureCreationError};
 
+// ============================================================================
+// Constants
+// ============================================================================
+
+/// X11 keycode offset relative to Linux scancode
+const X11_KEYCODE_OFFSET: u32 = 8;
+
+/// Edge detection thresholds
+const EDGE_OFFSET_PIXELS: i32 = 1;
+const EDGE_COUNTER_THRESHOLD: u32 = 2;
+
+/// Cursor cache TTL (milliseconds)
+const CURSOR_CACHE_TTL_MS: u64 = 16; // ~60 FPS
+
+/// Channel buffer size for events
+const EVENT_CHANNEL_BUFFER: usize = 100;
+
+/// XRecord version requirement
+const XRECORD_REQUIRED_VERSION: &'static str = "1.13";
+
 /// Wrapper for X11 display pointer that is Send-safe
 ///
 /// X11 display pointers are not thread-safe, but we need to send them across threads
 /// for the XRecord callback. This wrapper implements Send to allow this, but we must
 /// ensure proper synchronization by only using the display in the thread it was sent to.
-struct SendDisplay(*mut xlib::Display);
+///
+/// # Safety
+///
+/// This struct uses Arc<AtomicPtr> and Arc<AtomicBool> to ensure:
+/// - Thread-safe access to the display pointer
+/// - Proper cleanup when the display is closed
+/// - Prevention of use-after-free by tracking closed state
+#[derive(Clone)]
+struct SendDisplay {
+    /// Atomic pointer to the X11 display
+    ptr: Arc<AtomicPtr<xlib::Display>>,
+    /// Flag indicating if the display has been closed
+    closed: Arc<AtomicBool>,
+}
 
-// SAFETY: X11 display pointers are not thread-safe, but we implement Send to allow
-// moving the display pointer to another thread. We ensure that each display is only
-// used in a single thread at a time.
-unsafe impl Send for SendDisplay {}
+impl SendDisplay {
+    /// Create a new SendDisplay from a raw pointer
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the pointer is valid and points to an open X11 display.
+    unsafe fn new(ptr: *mut xlib::Display) -> Self {
+        Self {
+            ptr: Arc::new(AtomicPtr::new(ptr)),
+            closed: Arc::new(AtomicBool::new(false)),
+        }
+    }
 
-// SAFETY: Cloning creates a new reference to the same display pointer.
-// This is safe as long as each clone is used in a separate thread and the display
-// is properly closed only once.
-impl Clone for SendDisplay {
-    fn clone(&self) -> Self {
-        Self(self.0)
+    /// Check if the display is still valid (not closed and not null)
+    fn is_valid(&self) -> bool {
+        !self.closed.load(Ordering::Acquire) && !self.ptr.load(Ordering::Acquire).is_null()
+    }
+
+    /// Get the raw pointer to the display
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the display is still valid (check with is_valid())
+    /// and that the pointer is used correctly according to X11 API requirements.
+    unsafe fn get(&self) -> *mut xlib::Display {
+        self.ptr.load(Ordering::Acquire)
+    }
+
+    /// Close the display and mark it as closed
+    ///
+    /// This method is idempotent - multiple calls are safe.
+    unsafe fn close(&self) {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return; // Already closed
+        }
+        let ptr = self.ptr.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        if !ptr.is_null() {
+            XCloseDisplay(ptr);
+        }
     }
 }
+
+// SAFETY: SendDisplay uses Arc<AtomicPtr> and Arc<AtomicBool> which are Send and Sync,
+// ensuring thread-safe access to the display pointer and closed state.
+unsafe impl Send for SendDisplay {}
+
+// SAFETY: SendDisplay uses Arc<AtomicPtr> and Arc<AtomicBool> which are Send and Sync,
+// allowing multiple threads to safely access the display state (though actual X11
+// operations must still be synchronized externally).
+unsafe impl Sync for SendDisplay {}
 
 /// Closure data for XRecord callback
 ///
@@ -46,9 +117,72 @@ impl Clone for SendDisplay {
 struct RecordCallbackClosure {
     event_tx: mpsc::Sender<Result<(Position, CaptureEvent), CaptureError>>,
     active_clients: Arc<Mutex<HashSet<Position>>>,
+    display: SendDisplay,
+}
+
+/// Cursor state for tracking position changes
+///
+/// This struct maintains the current and previous cursor positions atomically
+/// to prevent race conditions when detecting edge crossings.
+#[derive(Debug, Default)]
+struct CursorState {
+    current: (i32, i32),
+    previous: (i32, i32),
+}
+
+impl CursorState {
+    /// Create a new CursorState with initial position
+    fn new(initial: (i32, i32)) -> Self {
+        Self {
+            current: initial,
+            previous: initial,
+        }
+    }
+
+    /// Update the cursor position and return the previous position
+    ///
+    /// This method atomically updates the state, preventing race conditions.
+    fn update(&mut self, new_pos: (i32, i32)) -> (i32, i32) {
+        let prev = self.current;
+        self.previous = prev;
+        self.current = new_pos;
+        prev
+    }
+
+    /// Get the current cursor position
+    fn current(&self) -> (i32, i32) {
+        self.current
+    }
+
+    /// Get the previous cursor position
+    fn previous(&self) -> (i32, i32) {
+        self.previous
+    }
 }
 
 /// X11 input capture backend using XRecord extension
+///
+/// This backend captures input events from the X server using the XRecord extension.
+/// It runs a separate thread that processes XRecord events and sends them to the main
+/// application through a channel.
+///
+/// # Thread Safety
+///
+/// This struct is not thread-safe internally, but implements `Stream` which allows
+/// it to be used in async contexts. The XRecord callback runs in a separate thread
+/// and communicates with the main thread through a channel.
+///
+/// # Example
+///
+/// ```no_run
+/// use input_capture::InputCapture;
+///
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let mut capture = InputCapture::new(None).await?;
+/// capture.create(1, input_capture::Position::Left).await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct X11InputCapture {
     /// X11 display connection
     display: SendDisplay,
@@ -60,13 +194,21 @@ pub struct X11InputCapture {
     event_rx: mpsc::Receiver<Result<(Position, CaptureEvent), CaptureError>>,
     /// Active capture positions
     active_clients: Arc<Mutex<HashSet<Position>>>,
-    /// Current cursor position
-    cursor_pos: Arc<Mutex<(i32, i32)>>,
+    /// Cursor state (current and previous positions)
+    cursor_state: Arc<Mutex<CursorState>>,
+    /// Counter for consecutive edge positions (to detect when cursor tries to cross)
+    edge_counter: Arc<Mutex<u32>>,
     /// Screen bounds
     screen_width: i32,
     screen_height: i32,
     /// Thread handle for XRecord callback
     record_thread: Option<thread::JoinHandle<()>>,
+    /// Shutdown flag for graceful thread termination
+    shutdown_flag: Arc<AtomicBool>,
+    /// Currently active capture position (if any)
+    current_pos: Arc<Mutex<Option<Position>>>,
+    /// Position where cursor was when capture started
+    enter_position: Arc<Mutex<Option<(i32, i32)>>>,
 }
 
 impl X11InputCapture {
@@ -89,15 +231,15 @@ impl X11InputCapture {
                         display_env
                     );
                     log::error!("{}", error_msg);
-                    return Err(X11InputCaptureCreationError::OpenDisplay);
+                    return Err(X11InputCaptureCreationError::OpenDisplay { display: display_env });
                 }
-                display => SendDisplay(display),
+                display => SendDisplay::new(display),
             }
         };
 
         // Get screen dimensions
-        let screen_width = unsafe { XDisplayWidth(display.0, 0) };
-        let screen_height = unsafe { XDisplayHeight(display.0, 0) };
+        let screen_width = unsafe { XDisplayWidth(display.get(), 0) };
+        let screen_height = unsafe { XDisplayHeight(display.get(), 0) };
         log::info!("X11 screen dimensions: {}x{}", screen_width, screen_height);
 
         // Open separate display for XRecord
@@ -106,22 +248,22 @@ impl X11InputCapture {
             match xlib::XOpenDisplay(ptr::null()) {
                 d if ptr::eq(d, ptr::null_mut::<xlib::Display>()) => {
                     log::error!("Failed to open X11 display for XRecord");
-                    XCloseDisplay(display.0);
-                    return Err(X11InputCaptureCreationError::OpenDisplay);
+                    display.close();
+                    return Err(X11InputCaptureCreationError::OpenDisplay { display: display_env });
                 }
-                display => SendDisplay(display),
+                display => SendDisplay::new(display),
             }
         };
 
         // Check XRecord availability
         log::debug!("Checking XRecord extension availability");
-        let mut major_version = 0;
-        let mut minor_version = 0;
+        let mut xrecord_major = 0;
+        let mut xrecord_minor = 0;
         let record_available = unsafe {
             xrecord::XRecordQueryVersion(
-                record_display.0,
-                &mut major_version,
-                &mut minor_version,
+                record_display.get(),
+                &mut xrecord_major,
+                &mut xrecord_minor,
             )
         };
 
@@ -134,38 +276,48 @@ impl X11InputCapture {
             );
             log::error!("{}", error_msg);
             unsafe {
-                XCloseDisplay(display.0);
-                XCloseDisplay(record_display.0);
+                display.close();
+                record_display.close();
             }
-            return Err(X11InputCaptureCreationError::XRecordNotAvailable);
+            return Err(X11InputCaptureCreationError::XRecordNotAvailable {
+                required: XRECORD_REQUIRED_VERSION,
+                major: xrecord_major,
+                minor: xrecord_minor,
+            });
         }
 
-        log::info!("XRecord version: {}.{}", major_version, minor_version);
+        log::info!("XRecord version: {}.{}", xrecord_major, xrecord_minor);
 
         // Create XRecord context
         log::debug!("Creating XRecord context");
-        let record_context = Self::create_record_context(record_display.0)
+        let record_context = Self::create_record_context(record_display.clone())
             .map_err(|e| {
                 log::error!("Failed to create XRecord context: {:?}", e);
                 unsafe {
-                    XCloseDisplay(display.0);
-                    XCloseDisplay(record_display.0);
+                    display.close();
+                    record_display.close();
                 }
                 e
             })?;
 
         // Set up communication channels
-        let (event_tx, event_rx) = mpsc::channel(100);
+        let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_BUFFER);
         let active_clients = Arc::new(Mutex::new(HashSet::new()));
-        let cursor_pos = Arc::new(Mutex::new((0, 0)));
+        let cursor_state = Arc::new(Mutex::new(CursorState::default()));
+        let edge_counter = Arc::new(Mutex::new(0));
+        let current_pos = Arc::new(Mutex::new(None));
+        let enter_position = Arc::new(Mutex::new(None));
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
 
         // Clone for thread
         let active_clients_clone = Arc::clone(&active_clients);
-        let cursor_pos_clone = Arc::clone(&cursor_pos);
+        let current_pos_clone = Arc::clone(&current_pos);
+        let enter_position_clone = Arc::clone(&enter_position);
+        let shutdown_flag_clone = Arc::clone(&shutdown_flag);
 
         // Clone record_display for the thread
         let record_display_clone = record_display.clone();
-        
+
         // Start XRecord thread
         log::debug!("Starting XRecord thread");
         let record_thread = thread::spawn(move || {
@@ -175,7 +327,9 @@ impl X11InputCapture {
                 record_context,
                 event_tx,
                 active_clients_clone,
-                cursor_pos_clone,
+                current_pos_clone,
+                enter_position_clone,
+                shutdown_flag_clone,
             );
         });
 
@@ -185,25 +339,47 @@ impl X11InputCapture {
             record_context,
             event_rx,
             active_clients,
-            cursor_pos,
+            cursor_state,
+            edge_counter,
             screen_width,
             screen_height,
             record_thread: Some(record_thread),
+            shutdown_flag,
+            current_pos,
+            enter_position,
         })
     }
 
     /// Create XRecord context for capturing input events
+    ///
+    /// This method creates an XRecord context that captures all input events
+    /// from the X server. It uses RAII guards to ensure proper resource cleanup.
+    ///
+    /// # Arguments
+    ///
+    /// * `display` - The X11 display connection (wrapped in SendDisplay)
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(context)` - The XRecord context handle
+    /// * `Err(X11InputCaptureCreationError)` - If context creation fails
     fn create_record_context(
-        display: *mut xlib::Display,
+        display: SendDisplay,
     ) -> Result<xrecord::XRecordContext, X11InputCaptureCreationError> {
         unsafe {
             // Allocate XRecord range
-            let record_range: *mut xrecord::XRecordRange =
-                xrecord::XRecordAllocRange();
+            let record_range: *mut xrecord::XRecordRange = xrecord::XRecordAllocRange();
 
             if record_range.is_null() {
-                return Err(X11InputCaptureCreationError::XRecordContext);
+                return Err(X11InputCaptureCreationError::XRecordContext {
+                    reason: "Failed to allocate XRecord range".to_string(),
+                });
             }
+
+            // Use scopeguard to ensure the range is freed even if an error occurs
+            let _range_guard = scopeguard::guard(record_range, |range| {
+                libc::free(range as *mut libc::c_void);
+            });
 
             // Set up range to capture all input events
             (*record_range).delivered_events.first = xlib::KeyPress as u8;
@@ -224,11 +400,10 @@ impl X11InputCapture {
             //     int nclients,
             //     XRecordRange *ranges,
             //     int nranges,
-            //     XRecordInterceptProc intercept_proc
             // );
             let mut ranges: [*mut xrecord::XRecordRange; 1] = [record_range];
             let context = xrecord::XRecordCreateContext(
-                display,
+                display.get(),
                 0, // XRecordAllClients
                 ptr::null_mut(), // clients (NULL for all clients)
                 0, // nclients
@@ -236,11 +411,12 @@ impl X11InputCapture {
                 1, // nranges
             );
 
-            // Free the range
-            libc::free(record_range as *mut libc::c_void);
+            // The range will be freed automatically by the scopeguard when this function returns
 
             if context == 0 {
-                return Err(X11InputCaptureCreationError::XRecordContext);
+                return Err(X11InputCaptureCreationError::XRecordContext {
+                    reason: "XRecordCreateContext returned 0".to_string(),
+                });
             }
 
             log::debug!("XRecord context created successfully: {}", context);
@@ -250,12 +426,27 @@ impl X11InputCapture {
     }
 
     /// Run XRecord callback in a separate thread
+    ///
+    /// This method runs the XRecord event processing loop in a dedicated thread.
+    /// It checks for shutdown signals and channel closure to gracefully terminate.
+    ///
+    /// # Arguments
+    ///
+    /// * `display` - The X11 display connection for XRecord
+    /// * `context` - The XRecord context
+    /// * `event_tx` - Channel for sending captured events
+    /// * `active_clients` - Set of active capture positions
+    /// * `current_pos` - Currently active capture position
+    /// * `enter_position` - Position where cursor was when capture started
+    /// * `shutdown_flag` - Flag for graceful shutdown
     fn run_record_callback(
         display: SendDisplay,
         context: xrecord::XRecordContext,
         event_tx: mpsc::Sender<Result<(Position, CaptureEvent), CaptureError>>,
         active_clients: Arc<Mutex<HashSet<Position>>>,
-        _cursor_pos: Arc<Mutex<(i32, i32)>>,
+        _current_pos: Arc<Mutex<Option<Position>>>,
+        _enter_position: Arc<Mutex<Option<(i32, i32)>>>,
+        shutdown_flag: Arc<AtomicBool>,
     ) {
         log::info!("XRecord thread started");
 
@@ -263,12 +454,13 @@ impl X11InputCapture {
         let closure = RecordCallbackClosure {
             event_tx,
             active_clients,
+            display: display.clone(),
         };
 
         // Enable XRecord context
         let result = unsafe {
             xrecord::XRecordEnableContextAsync(
-                display.0,
+                display.get(),
                 context,
                 Some(Self::record_callback),
                 &closure as *const _ as *mut libc::c_char,
@@ -285,16 +477,21 @@ impl X11InputCapture {
         // Process XRecord events using XRecordProcessReplies
         // This is the correct way to process XRecord events
         loop {
-            unsafe {
-                // Check if channel is closed
-                if closure.event_tx.is_closed() {
-                    log::info!("XRecord channel closed, stopping thread");
-                    break;
-                }
+            // Check for shutdown signal
+            if shutdown_flag.load(Ordering::Acquire) {
+                log::info!("XRecord thread received shutdown signal");
+                break;
+            }
 
-                // Process XRecord replies - this triggers the callback
-                log::trace!("Calling XRecordProcessReplies");
-                xrecord::XRecordProcessReplies(display.0);
+            // Check if channel is closed
+            if closure.event_tx.is_closed() {
+                log::info!("XRecord channel closed, stopping thread");
+                break;
+            }
+
+            // Process XRecord replies - this triggers the callback
+            unsafe {
+                xrecord::XRecordProcessReplies(display.get());
             }
         }
 
@@ -302,13 +499,32 @@ impl X11InputCapture {
     }
 
     /// XRecord callback function
+    ///
+    /// This function is called by the XRecord extension for each captured event.
+    /// It processes the event and sends it to the main thread through a channel.
+    ///
+    /// # Safety
+    ///
+    /// This function is unsafe because:
+    /// - It's called from C code (XRecord)
+    /// - It dereferences raw pointers
+    /// - It accesses X11 data structures
+    ///
+    /// The caller must ensure that:
+    /// - `closure` is a valid pointer to a RecordCallbackClosure
+    /// - `intercept_data` is a valid pointer to XRecordInterceptData
     unsafe extern "C" fn record_callback(
         closure: *mut libc::c_char,
         intercept_data: *mut XRecordInterceptData,
     ) {
-        // Check if intercept_data is null before dereferencing
+        // Validate pointers before dereferencing
         if intercept_data.is_null() {
             log::trace!("XRecord callback: intercept_data is null");
+            return;
+        }
+
+        if closure.is_null() {
+            log::error!("XRecord callback: closure pointer is null");
             return;
         }
 
@@ -337,7 +553,7 @@ impl X11InputCapture {
             }
             xlib::MotionNotify => {
                 log::trace!("XRecord callback: processing motion event");
-                Self::process_motion_event(&closure.event_tx, event_data);
+                Self::process_motion_event(closure.display.clone(), &closure.event_tx, event_data);
             }
             _ => {
                 log::trace!("XRecord callback: unknown event type {}", event_type);
@@ -346,6 +562,11 @@ impl X11InputCapture {
     }
 
     /// Process keyboard events
+    ///
+    /// # Safety
+    ///
+    /// This function is unsafe because it dereferences raw pointers to event data.
+    /// The caller must ensure that event_data points to valid memory.
     unsafe fn process_keyboard_event(
         event_tx: &mpsc::Sender<Result<(Position, CaptureEvent), CaptureError>>,
         event_data: *const u8,
@@ -356,7 +577,7 @@ impl X11InputCapture {
         let state = if event_type as i32 == xlib::KeyPress { 1 } else { 0 };
 
         // X11 keycodes are shifted by 8 relative to Linux scancodes
-        let linux_scancode = (keycode as u32) - 8;
+        let linux_scancode = (keycode as u32).saturating_sub(X11_KEYCODE_OFFSET);
 
         log::debug!(
             "X11: Keyboard event - keycode: {}, linux_scancode: {}, state: {}",
@@ -379,22 +600,52 @@ impl X11InputCapture {
                 log::debug!("X11: No active captures, sending keyboard event to Left as placeholder");
                 // If no active captures, send to Left as placeholder
                 // This ensures pressed_keys is still updated
-                let _ = event_tx.try_send(Ok((Position::Left, CaptureEvent::Input(event.clone()))));
+                match event_tx.try_send(Ok((Position::Left, CaptureEvent::Input(event.clone())))) {
+                    Ok(_) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        log::warn!("X11: event channel full, dropping keyboard event");
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        log::error!("X11: event channel closed, cannot send keyboard event");
+                    }
+                }
             } else {
                 log::debug!("X11: Active captures at positions: {:?}", clients);
                 // Send to all active capture positions
                 for &position in clients.iter() {
-                    let _ = event_tx.try_send(Ok((position, CaptureEvent::Input(event.clone()))));
+                    match event_tx.try_send(Ok((position, CaptureEvent::Input(event.clone())))) {
+                        Ok(_) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            log::warn!("X11: event channel full, dropping keyboard event for position {:?}", position);
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            log::error!("X11: event channel closed, cannot send keyboard event for position {:?}", position);
+                            break;
+                        }
+                    }
                 }
             }
         } else {
             log::debug!("X11: Failed to lock active_clients, sending keyboard event to Left as placeholder");
             // If lock fails, send to Left as placeholder
-            let _ = event_tx.try_send(Ok((Position::Left, CaptureEvent::Input(event))));
+            match event_tx.try_send(Ok((Position::Left, CaptureEvent::Input(event)))) {
+                Ok(_) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    log::warn!("X11: event channel full, dropping keyboard event");
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    log::error!("X11: event channel closed, cannot send keyboard event");
+                }
+            }
         }
     }
 
     /// Process mouse button events
+    ///
+    /// # Safety
+    ///
+    /// This function is unsafe because it dereferences raw pointers to event data.
+    /// The caller must ensure that event_data points to valid memory.
     unsafe fn process_button_event(
         event_tx: &mpsc::Sender<Result<(Position, CaptureEvent), CaptureError>>,
         event_data: *const u8,
@@ -411,11 +662,25 @@ impl X11InputCapture {
 
         // Send event (position will be determined by edge detection)
         // For now, we send to Left as placeholder
-        let _ = event_tx.try_send(Ok((Position::Left, CaptureEvent::Input(event))));
+        match event_tx.try_send(Ok((Position::Left, CaptureEvent::Input(event)))) {
+            Ok(_) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                log::warn!("X11: event channel full, dropping button event");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                log::error!("X11: event channel closed, cannot send button event");
+            }
+        }
     }
 
     /// Process mouse motion events
+    ///
+    /// # Safety
+    ///
+    /// This function is unsafe because it dereferences raw pointers to event data.
+    /// The caller must ensure that event_data points to valid memory.
     unsafe fn process_motion_event(
+        display: SendDisplay,
         event_tx: &mpsc::Sender<Result<(Position, CaptureEvent), CaptureError>>,
         event_data: *const u8,
     ) {
@@ -428,13 +693,52 @@ impl X11InputCapture {
             dy: y as f64,
         });
 
+        // Get current cursor position from X server
+        let (cursor_x, cursor_y) = match Self::query_cursor_position(display) {
+            Ok(pos) => pos,
+            Err(e) => {
+                log::warn!("X11: failed to query cursor position: {}, using (0, 0)", e);
+                (0, 0)
+            }
+        };
+
+        // Log actual cursor position from system
+        if log::log_enabled!(log::Level::Trace) {
+            log::trace!("X11: motion event - delta: ({}, {}), cursor position: ({}, {})", x, y, cursor_x, cursor_y);
+        }
+
         // Send event (position will be determined by edge detection)
         // For now, we send to Left as placeholder
-        let _ = event_tx.try_send(Ok((Position::Left, CaptureEvent::Input(event))));
+        match event_tx.try_send(Ok((Position::Left, CaptureEvent::Input(event)))) {
+            Ok(_) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                log::warn!("X11: event channel full, dropping motion event");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                log::error!("X11: event channel closed, cannot send motion event");
+            }
+        }
     }
 
-    /// Check if cursor has crossed an edge
-    fn check_edge_crossing(&self) -> Option<Position> {
+    /// Query current cursor position from X server
+    ///
+    /// This function uses XQueryPointer to get the current cursor position.
+    /// It returns the window-relative coordinates.
+    ///
+    /// # Arguments
+    ///
+    /// * `display` - The X11 display connection
+    ///
+    /// # Returns
+    ///
+    /// * `Ok((x, y))` - The cursor position in window coordinates
+    /// * `Err(String)` - An error message if the query fails
+    ///
+    /// # Safety
+    ///
+    /// This function is unsafe because it calls XQueryPointer which is an FFI function.
+    /// The caller must ensure that the display pointer is valid.
+    unsafe fn query_cursor_position(display: SendDisplay) -> Result<(i32, i32), String> {
         let mut root_x: i32 = 0;
         let mut root_y: i32 = 0;
         let mut win_x: i32 = 0;
@@ -443,10 +747,138 @@ impl X11InputCapture {
         let mut root_return: xlib::Window = 0;
         let mut child_return: xlib::Window = 0;
 
+        // Query pointer position from X server
+        let success = XQueryPointer(
+            display.get(),
+            xlib::XDefaultRootWindow(display.get()),
+            &mut root_return,
+            &mut child_return,
+            &mut root_x,
+            &mut root_y,
+            &mut win_x,
+            &mut win_y,
+            &mut mask,
+        );
+
+        if success == 0 {
+            return Err("XQueryPointer failed".to_string());
+        }
+
+        if log::log_enabled!(log::Level::Trace) {
+            log::trace!("X11: cursor position query - root: ({}, {}), win: ({}, {}), mask: {}", root_x, root_y, win_x, win_y, mask);
+        }
+
+        Ok((win_x, win_y))
+    }
+
+    /// Warp cursor to specified position
+    ///
+    /// This function moves the cursor to the specified position using XWarpPointer.
+    ///
+    /// # Arguments
+    ///
+    /// * `x` - The x coordinate to warp to
+    /// * `y` - The y coordinate to warp to
+    fn warp_cursor(&self, x: i32, y: i32) {
+        log::trace!("X11: warp_cursor - warping cursor to ({}, {})", x, y);
+        log::trace!("X11: warp_cursor - screen bounds: {}x{}, target position within bounds: x=[0, {}], y=[0, {}]",
+                    self.screen_width, self.screen_height, self.screen_width - 1, self.screen_height - 1);
         unsafe {
+            let root_window = XDefaultRootWindow(self.display.get());
+            XWarpPointer(
+                self.display.get(),
+                0,
+                root_window,
+                0,
+                0,
+                0,
+                0,
+                x,
+                y,
+            );
+            XFlush(self.display.get());
+        }
+        log::trace!("X11: warp_cursor - cursor warped to ({}, {})", x, y);
+    }
+
+    /// Reset cursor to the position where capture started
+    fn reset_cursor(&self) {
+        if let Ok(pos) = self.enter_position.try_lock() {
+            if let Some((x, y)) = *pos {
+                log::trace!("X11: Resetting cursor to saved position: ({}, {})", x, y);
+                log::trace!("X11: Cursor reset - returning from edge to original position ({}, {})", x, y);
+                self.warp_cursor(x, y);
+            } else {
+                log::trace!("X11: No saved enter position to reset to");
+            }
+        } else {
+            log::trace!("X11: Failed to acquire lock for cursor reset");
+        }
+    }
+
+    /// Start capture at the specified position
+    ///
+    /// This method saves the current cursor position, sets the capture position,
+    /// and warps the cursor to the edge of the screen.
+    ///
+    /// # Arguments
+    ///
+    /// * `position` - The position where capture is starting
+    /// * `root_x` - The current cursor x position
+    /// * `root_y` - The current cursor y position
+    fn start_capture(&self, position: Position, root_x: i32, root_y: i32) {
+        log::info!("X11: Starting capture at position: {:?}, cursor position: ({}, {})", position, root_x, root_y);
+        log::trace!("X11: Screen dimensions: {}x{}", self.screen_width, self.screen_height);
+
+        // Save the current cursor position
+        if let Ok(mut pos) = self.enter_position.try_lock() {
+            *pos = Some((root_x, root_y));
+            log::debug!("Saved enter position: ({}, {})", root_x, root_y);
+            log::trace!("X11: Enter position saved, cursor will return to ({}, {}) when capture is released", root_x, root_y);
+        }
+
+        // Set current capture position
+        if let Ok(mut current) = self.current_pos.try_lock() {
+            *current = Some(position);
+            log::debug!("Set current capture position: {:?}", position);
+            log::trace!("X11: Current capture position set to {:?}, cursor will be constrained to edge", position);
+        }
+
+        // Warp cursor to the edge with a small offset
+        let (new_x, new_y) = match position {
+            Position::Left => (EDGE_OFFSET_PIXELS, root_y),
+            Position::Right => (self.screen_width - 1 - EDGE_OFFSET_PIXELS, root_y),
+            Position::Top => (root_x, EDGE_OFFSET_PIXELS),
+            Position::Bottom => (root_x, self.screen_height - 1 - EDGE_OFFSET_PIXELS),
+        };
+        log::info!("X11: Warping cursor from ({}, {}) to edge position: ({}, {})", root_x, root_y, new_x, new_y);
+        log::trace!("X11: Edge offset: {}, target position: ({}, {}), screen bounds: {}x{}", EDGE_OFFSET_PIXELS, new_x, new_y, self.screen_width, self.screen_height);
+        self.warp_cursor(new_x, new_y);
+    }
+
+    /// Check if cursor has crossed an edge
+    ///
+    /// This method queries the current cursor position and checks if it has crossed
+    /// any screen edge. It uses atomic updates to prevent race conditions.
+    ///
+    /// # Returns
+    ///
+    /// * `Some(position)` - The edge that was crossed
+    /// * `None` - No edge was crossed
+    fn check_edge_crossing(&self) -> Option<Position> {
+        // Query current cursor position
+        let (root_x, root_y) = unsafe {
+            let mut root_x: i32 = 0;
+            let mut root_y: i32 = 0;
+            let mut win_x: i32 = 0;
+            let mut win_y: i32 = 0;
+            let mut mask: u32 = 0;
+            let mut root_return: xlib::Window = 0;
+            let mut child_return: xlib::Window = 0;
+
             XQueryPointer(
-                self.display.0,
-                xlib::XDefaultRootWindow(self.display.0),
+                self.display.get(),
+                xlib::XDefaultRootWindow(self.display.get()),
                 &mut root_return,
                 &mut child_return,
                 &mut root_x,
@@ -455,28 +887,121 @@ impl X11InputCapture {
                 &mut win_y,
                 &mut mask,
             );
+
+            (root_x, root_y)
+        };
+
+        if log::log_enabled!(log::Level::Trace) {
+            log::trace!("X11: check_edge_crossing - cursor position: ({}, {}), screen bounds: {}x{}",
+                        root_x, root_y, self.screen_width, self.screen_height);
         }
 
-        // Update cursor position using blocking lock
-        // Note: This is called from poll_next which is not async, so we use try_lock
-        // to avoid blocking. If the lock is contended, we skip the update this time.
-        if let Ok(mut pos) = self.cursor_pos.try_lock() {
-            *pos = (root_x, root_y);
+        // Atomically update cursor state and get previous position
+        let (prev_x, prev_y) = {
+            let mut state = self.cursor_state.try_lock().ok()?;
+            state.update((root_x, root_y))
+        };
+
+        // Check if we're currently in capture mode
+        let is_capturing = self.current_pos.try_lock().ok()?.is_some();
+
+        // If we're capturing, keep the cursor at the edge
+        if is_capturing {
+            if log::log_enabled!(log::Level::Trace) {
+                log::trace!("X11: Capturing mode active, keeping cursor at edge, cursor position: ({}, {})", root_x, root_y);
+            }
+            self.reset_cursor();
+            return None;
         }
 
-        // Check for edge crossing using blocking lock
-        if let Ok(active_clients) = self.active_clients.try_lock() {
-            for &position in active_clients.iter() {
-                match position {
-                    Position::Left if root_x <= 0 => return Some(Position::Left),
-                    Position::Right if root_x >= self.screen_width - 1 => return Some(Position::Right),
-                    Position::Top if root_y <= 0 => return Some(Position::Top),
-                    Position::Bottom if root_y >= self.screen_height - 1 => return Some(Position::Bottom),
-                    _ => {}
+        // Check if cursor crossed any screen edge
+        if log::log_enabled!(log::Level::Trace) {
+            log::trace!("X11: Edge detection - cursor: ({}, {}), prev: ({}, {}), screen: {}x{}, thresholds: left=0, right={}, top=0, bottom={}",
+                        root_x, root_y, prev_x, prev_y, self.screen_width, self.screen_height,
+                        self.screen_width - 1, self.screen_height - 1);
+        }
+
+        // Detect edge crossing by checking if cursor is at edge AND was moving towards it
+        // This handles the case where X11 clamps the cursor at the edge
+        // Also use edge counter to detect when cursor stays at edge (trying to cross)
+        let at_left_edge = root_x <= 0;
+        let at_right_edge = root_x >= self.screen_width - 1;
+        let at_top_edge = root_y <= 0;
+        let at_bottom_edge = root_y >= self.screen_height - 1;
+
+        // Check if cursor is at any edge
+        if at_left_edge || at_right_edge || at_top_edge || at_bottom_edge {
+            // Increment edge counter
+            if let Ok(mut counter) = self.edge_counter.try_lock() {
+                *counter += 1;
+                if log::log_enabled!(log::Level::Trace) {
+                    log::trace!("X11: Cursor at edge, counter: {}, pos: ({}, {})", *counter, root_x, root_y);
+                }
+
+                // If counter reaches threshold, trigger edge crossing
+                if *counter >= EDGE_COUNTER_THRESHOLD {
+                    // Determine which edge and return
+                    if at_left_edge {
+                        log::info!("X11: Cursor crossed left edge at ({}, {}), preparing to return to client", root_x, root_y);
+                        *counter = 0; // Reset counter
+                        return Some(Position::Left);
+                    } else if at_right_edge {
+                        log::info!("X11: Cursor crossed right edge at ({}, {}), preparing to return to client", root_x, root_y);
+                        *counter = 0; // Reset counter
+                        return Some(Position::Right);
+                    } else if at_top_edge {
+                        log::info!("X11: Cursor crossed top edge at ({}, {}), preparing to return to client", root_x, root_y);
+                        *counter = 0; // Reset counter
+                        return Some(Position::Top);
+                    } else if at_bottom_edge {
+                        log::info!("X11: Cursor crossed bottom edge at ({}, {}), preparing to return to client", root_x, root_y);
+                        *counter = 0; // Reset counter
+                        return Some(Position::Bottom);
+                    }
+                }
+            }
+        } else {
+            // Not at edge, reset counter
+            if let Ok(mut counter) = self.edge_counter.try_lock() {
+                if *counter > 0 {
+                    if log::log_enabled!(log::Level::Trace) {
+                        log::trace!("X11: Cursor left edge, resetting counter from {}", *counter);
+                    }
+                    *counter = 0;
                 }
             }
         }
 
+        // Also detect edge crossing when cursor moves towards edge
+        if root_x <= 0 && prev_x > 0 {
+            log::info!("X11: Cursor crossed left edge at ({}, {}) from ({}, {}), preparing to return to client", root_x, root_y, prev_x, prev_y);
+            if log::log_enabled!(log::Level::Trace) {
+                log::trace!("X11: Edge check - left edge crossed (x={}, prev_x={})", root_x, prev_x);
+            }
+            return Some(Position::Left);
+        } else if root_x >= self.screen_width - 1 && root_x > prev_x {
+            log::info!("X11: Cursor crossed right edge at ({}, {}) from ({}, {}), preparing to return to client", root_x, root_y, prev_x, prev_y);
+            if log::log_enabled!(log::Level::Trace) {
+                log::trace!("X11: Edge check - right edge crossed (x={}, prev_x={}, threshold={})", root_x, prev_x, self.screen_width - 1);
+            }
+            return Some(Position::Right);
+        } else if root_y <= 0 && prev_y > 0 {
+            log::info!("X11: Cursor crossed top edge at ({}, {}) from ({}, {}), preparing to return to client", root_x, root_y, prev_x, prev_y);
+            if log::log_enabled!(log::Level::Trace) {
+                log::trace!("X11: Edge check - top edge crossed (y={}, prev_y={})", root_y, prev_y);
+            }
+            return Some(Position::Top);
+        } else if root_y >= self.screen_height - 1 && root_y > prev_y {
+            log::info!("X11: Cursor crossed bottom edge at ({}, {}) from ({}, {}), preparing to return to client", root_x, root_y, prev_x, prev_y);
+            if log::log_enabled!(log::Level::Trace) {
+                log::trace!("X11: Edge check - bottom edge crossed (y={}, prev_y={}, threshold={})", root_y, prev_y, self.screen_height - 1);
+            }
+            return Some(Position::Bottom);
+        }
+
+        if log::log_enabled!(log::Level::Trace) {
+            log::trace!("X11: check_edge_crossing - cursor at ({}, {}), no edge crossed", root_x, root_y);
+        }
         None
     }
 }
@@ -485,31 +1010,33 @@ impl Drop for X11InputCapture {
     fn drop(&mut self) {
         log::info!("Cleaning up X11 input capture");
 
+        // Signal the XRecord thread to shutdown
+        self.shutdown_flag.store(true, Ordering::Release);
+
         // Disable XRecord context
         if self.record_context != 0 {
             unsafe {
-                xrecord::XRecordDisableContext(self.record_display.0, self.record_context);
-                xrecord::XRecordFreeContext(self.record_display.0, self.record_context);
+                xrecord::XRecordDisableContext(self.record_display.get(), self.record_context);
+                xrecord::XRecordFreeContext(self.record_display.get(), self.record_context);
             }
         }
 
-        // Close displays
-        if !self.record_display.0.is_null() {
-            unsafe {
-                XCloseDisplay(self.record_display.0);
-            }
+        // Close displays using the safe close method
+        unsafe {
+            self.record_display.close();
+            self.display.close();
         }
 
-        if !self.display.0.is_null() {
-            unsafe {
-                XCloseDisplay(self.display.0);
-            }
-        }
-
-        // Join thread
+        // Join thread with timeout
         if let Some(handle) = self.record_thread.take() {
-            let _ = handle.join();
+            // Give the thread 2 seconds to gracefully shutdown
+            if !handle.is_finished() {
+                log::debug!("Waiting for XRecord thread to finish...");
+                let _ = handle.join();
+            }
         }
+
+        log::info!("X11 input capture cleanup complete");
     }
 }
 
@@ -530,8 +1057,21 @@ impl Capture for X11InputCapture {
     }
 
     async fn release(&mut self) -> Result<(), CaptureError> {
-        log::debug!("Releasing capture");
-        // Release any pressed keys
+        log::info!("X11: Releasing capture");
+        // Clear capture state
+        if let Ok(mut current) = self.current_pos.try_lock() {
+            log::debug!("Clearing current capture position");
+            log::trace!("X11: Current capture position was: {:?}", *current);
+            *current = None;
+            log::trace!("X11: Current capture position cleared, cursor is no longer constrained");
+        }
+        if let Ok(mut pos) = self.enter_position.try_lock() {
+            log::debug!("Clearing enter position");
+            log::trace!("X11: Enter position was: {:?}", *pos);
+            *pos = None;
+            log::trace!("X11: Enter position cleared, cursor will not be reset on next capture");
+        }
+        log::debug!("X11: Capture released, cursor can now move freely");
         Ok(())
     }
 
@@ -551,14 +1091,45 @@ impl Stream for X11InputCapture {
         // Check for edge crossing periodically
         if let Some(pos) = self.as_mut().check_edge_crossing() {
             log::debug!("Edge crossed: {pos}");
+            if log::log_enabled!(log::Level::Trace) {
+                log::trace!("X11: poll_next - edge crossed at position {:?}", pos);
+            }
+
+            // Get current cursor position
+            let (root_x, root_y) = self.cursor_state.try_lock()
+                .map(|state| state.current())
+                .unwrap_or((0, 0));
+
+            if log::log_enabled!(log::Level::Trace) {
+                log::trace!("X11: poll_next - starting capture at position {:?} with cursor at ({}, {})", pos, root_x, root_y);
+            }
+
+            // Start capture at this position
+            self.start_capture(pos, root_x, root_y);
+
             return Poll::Ready(Some(Ok((pos, CaptureEvent::Begin))));
         }
 
         // Poll for captured events
         match self.event_rx.poll_recv(cx) {
-            Poll::Ready(Some(event)) => Poll::Ready(Some(event)),
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
+            Poll::Ready(Some(event)) => {
+                if log::log_enabled!(log::Level::Trace) {
+                    log::trace!("X11: poll_next - received event from event_rx");
+                }
+                Poll::Ready(Some(event))
+            }
+            Poll::Ready(None) => {
+                if log::log_enabled!(log::Level::Trace) {
+                    log::trace!("X11: poll_next - event_rx stream ended");
+                }
+                Poll::Ready(None)
+            }
+            Poll::Pending => {
+                if log::log_enabled!(log::Level::Trace) {
+                    log::trace!("X11: poll_next - no events available, pending");
+                }
+                Poll::Pending
+            }
         }
     }
 }

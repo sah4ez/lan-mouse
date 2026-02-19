@@ -137,16 +137,18 @@ pub enum LayerShellCaptureCreationError {
 #[cfg(all(unix, feature = "x11", not(target_os = "macos")))]
 #[derive(Debug, Error)]
 pub enum X11InputCaptureCreationError {
-    #[error("X11 input capture is not yet implemented :(")]
+    #[error("X11 input capture is not yet implemented")]
     NotImplemented,
-    #[error("Failed to open X11 display")]
-    OpenDisplay,
-    #[error("XRecord extension not available")]
-    XRecordNotAvailable,
-    #[error("Failed to create XRecord context")]
-    XRecordContext,
-    #[error("Failed to create XRecord thread")]
-    XRecordThread,
+    #[error("Failed to open X11 display: {display}")]
+    OpenDisplay { display: String },
+    #[error("XRecord extension not available (requires version {required}+, got {major}.{minor})")]
+    XRecordNotAvailable { required: &'static str, major: i32, minor: i32 },
+    #[error("Failed to create XRecord context: {reason}")]
+    XRecordContext { reason: String },
+    #[error("Failed to create XRecord thread: {reason}")]
+    XRecordThread { reason: String },
+    #[error("X11 error: {message}")]
+    Other { message: String },
 }
 
 #[cfg(target_os = "macos")]

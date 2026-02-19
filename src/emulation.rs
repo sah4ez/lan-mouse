@@ -133,7 +133,8 @@ impl ListenTask {
             select! {
                 e = self.listener.next() => {match e {
                     Some(ListenEvent::Msg { event, addr }) => {
-                        log::trace!("{event} <-<-<-<-<- {addr}");
+                        // Log events without calculating cursor position
+                        // log::trace!("{event} <-<-<-<-<- {addr}");
                         last_response.insert(addr, Instant::now());
                         match event {
                             ProtoEvent::Enter(pos) => {
@@ -241,11 +242,16 @@ impl EmulationProxy {
 
     async fn event(&mut self) -> EmulationEvent {
         let event = self.event_rx.recv().await.expect("channel closed");
-        if let EmulationEvent::EmulationEnabled = event {
-            self.emulation_active.replace(true);
-        }
-        if let EmulationEvent::EmulationDisabled = event {
-            self.emulation_active.replace(false);
+        match event {
+            EmulationEvent::EmulationEnabled => {
+                self.emulation_active.replace(true);
+                log::debug!("emulation proxy: emulation enabled");
+            }
+            EmulationEvent::EmulationDisabled => {
+                self.emulation_active.replace(false);
+                log::debug!("emulation proxy: emulation disabled");
+            }
+            _ => {}
         }
         event
     }
@@ -256,10 +262,13 @@ impl EmulationProxy {
             self.request_tx
                 .send(ProxyRequest::Input(event, addr))
                 .expect("channel closed");
+        } else {
+            log::trace!("emulation disabled, ignoring event from {addr}");
         }
     }
 
     fn remove(&self, addr: SocketAddr) {
+        log::debug!("removing emulation handle for {addr}");
         self.request_tx
             .send(ProxyRequest::Remove(addr))
             .expect("channel closed");
@@ -327,12 +336,14 @@ impl EmulationTask {
 
         // create active handles
         if let Err(e) = self.create_clients(&mut emulation).await {
+            log::warn!("failed to create emulation clients: {e}");
             emulation.terminate().await;
             return Err(e);
         }
 
         let res = self.do_emulation_session(&mut emulation).await;
         // FIXME replace with async drop when stabilized
+        log::debug!("terminating input emulation session");
         emulation.terminate().await;
         res
     }
@@ -363,6 +374,7 @@ impl EmulationTask {
                             None => {
                                 let handle = self.next_id;
                                 self.next_id += 1;
+                                log::debug!("creating new emulation handle {handle} for {addr}");
                                 emulation.create(handle).await;
                                 self.handles.insert(addr, handle);
                                 handle
@@ -372,6 +384,7 @@ impl EmulationTask {
                     },
                     ProxyRequest::Remove(addr) => {
                         if let Some(handle) = self.handles.remove(&addr) {
+                            log::debug!("destroying emulation handle {handle} for {addr}");
                             emulation.destroy(handle).await;
                         }
                     }

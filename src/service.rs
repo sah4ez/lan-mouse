@@ -24,11 +24,6 @@ use std::{
 use thiserror::Error;
 use tokio::{process::Command, signal, sync::Notify};
 
-#[cfg(target_os = "linux")]
-use x11::{
-    xlib::{self, XCloseDisplay, XDisplayHeight, XDisplayWidth, XQueryPointer},
-};
-
 #[derive(Debug, Error)]
 pub enum ServiceError {
     #[error(transparent)]
@@ -75,31 +70,11 @@ pub struct Service {
     /// map from capture handle to connection info
     incoming_conn_info: HashMap<ClientHandle, Incoming>,
     next_trigger_handle: u64,
-    /// cursor tracking thread handle for X11 edge crossing detection
-    #[cfg(target_os = "linux")]
-    cursor_tracking_thread: Option<thread::JoinHandle<()>>,
-    /// notify cursor tracking thread to stop
-    #[cfg(target_os = "linux")]
-    cursor_tracking_stop: Arc<std::sync::atomic::AtomicBool>,
-    /// channel for edge crossing events from cursor tracking thread
-    #[cfg(target_os = "linux")]
-    edge_crossing_rx: local_channel::mpsc::Receiver<EdgeCrossingEvent>,
-    /// channel for edge crossing events from cursor tracking thread
-    #[cfg(target_os = "linux")]
-    edge_crossing_tx: local_channel::mpsc::Sender<EdgeCrossingEvent>,
 }
 
 #[derive(Debug)]
 struct Incoming {
     fingerprint: String,
-    addr: SocketAddr,
-    pos: Position,
-}
-
-/// Edge crossing event from cursor tracking thread
-#[cfg(target_os = "linux")]
-#[derive(Debug, Clone)]
-struct EdgeCrossingEvent {
     addr: SocketAddr,
     pos: Position,
 }
@@ -148,12 +123,7 @@ impl Service {
         let resolver = DnsResolver::new()?;
 
         let port = config.port();
-        
-        #[cfg(target_os = "linux")]
-        let (edge_crossing_tx, edge_crossing_rx) = local_channel::mpsc::channel();
-        #[cfg(target_os = "linux")]
-        let (cursor_tracking_thread, cursor_tracking_stop) = Self::start_cursor_tracking(edge_crossing_tx);
-        
+
         let service = Self {
             config,
             capture,
@@ -171,127 +141,8 @@ impl Service {
             incoming_conn_info: Default::default(),
             incoming_conns: Default::default(),
             next_trigger_handle: 0,
-            #[cfg(target_os = "linux")]
-            cursor_tracking_thread,
-            #[cfg(target_os = "linux")]
-            cursor_tracking_stop,
-            #[cfg(target_os = "linux")]
-            edge_crossing_rx,
-            #[cfg(target_os = "linux")]
-            edge_crossing_tx,
         };
         Ok(service)
-    }
-
-    #[cfg(target_os = "linux")]
-    fn start_cursor_tracking(
-        edge_crossing_tx: local_channel::mpsc::Sender<EdgeCrossingEvent>,
-    ) -> (Option<thread::JoinHandle<()>>, Arc<std::sync::atomic::AtomicBool>) {
-        use std::ptr;
-        
-        // Check if X11 is available
-        let display_env = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_string());
-        log::info!("Starting cursor tracking for X11 display: {}", display_env);
-        
-        let display = unsafe {
-            match xlib::XOpenDisplay(ptr::null()) {
-                d if ptr::eq(d, ptr::null_mut::<xlib::Display>()) => {
-                    log::warn!("Failed to open X11 display for cursor tracking. Edge crossing detection will not be available.");
-                    return (None, Arc::new(std::sync::atomic::AtomicBool::new(true)));
-                }
-                display => display,
-            }
-        };
-        
-        let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let stop_flag_clone = stop_flag.clone();
-        
-        let handle = thread::spawn(move || {
-            log::info!("Cursor tracking thread started");
-            
-            // Get screen dimensions
-            let screen_width = unsafe { XDisplayWidth(display, 0) };
-            let screen_height = unsafe { XDisplayHeight(display, 0) };
-            log::info!("Screen dimensions: {}x{}", screen_width, screen_height);
-            
-            // Poll cursor position periodically
-            let poll_interval = Duration::from_millis(50); // 20 Hz
-            let mut last_edge_crossing_time = std::time::Instant::now();
-            let edge_crossing_cooldown = Duration::from_millis(500); // Prevent rapid edge crossing events
-            
-            while !stop_flag_clone.load(std::sync::atomic::Ordering::Relaxed) {
-                // Query cursor position
-                let mut root_x: i32 = 0;
-                let mut root_y: i32 = 0;
-                let mut win_x: i32 = 0;
-                let mut win_y: i32 = 0;
-                let mut mask: u32 = 0;
-                let mut root_return: xlib::Window = 0;
-                let mut child_return: xlib::Window = 0;
-                
-                unsafe {
-                    XQueryPointer(
-                        display,
-                        xlib::XDefaultRootWindow(display),
-                        &mut root_return,
-                        &mut child_return,
-                        &mut root_x,
-                        &mut root_y,
-                        &mut win_x,
-                        &mut win_y,
-                        &mut mask,
-                    );
-                }
-                
-                // Check for edge crossings
-                let edge_crossed = if root_x <= 0 {
-                    Some(Position::Left)
-                } else if root_x >= screen_width - 1 {
-                    Some(Position::Right)
-                } else if root_y <= 0 {
-                    Some(Position::Top)
-                } else if root_y >= screen_height - 1 {
-                    Some(Position::Bottom)
-                } else {
-                    None
-                };
-                
-                // If edge crossed and cooldown has elapsed, send event
-                if let Some(pos) = edge_crossed {
-                    let now = std::time::Instant::now();
-                    if now.duration_since(last_edge_crossing_time) >= edge_crossing_cooldown {
-                        log::info!("Cursor crossed edge at position {:?}", pos);
-                        
-                        // Send edge crossing event to service
-                        // Note: We don't have the address here, so we'll send None
-                        // The service will need to determine which connection to notify
-                        let event = EdgeCrossingEvent {
-                            addr: "0.0.0.0:0".parse().unwrap(), // Placeholder, will be determined by service
-                            pos,
-                        };
-                        
-                        if edge_crossing_tx.send(event).is_err() {
-                            log::warn!("Failed to send edge crossing event: channel closed");
-                            break;
-                        }
-                        
-                        last_edge_crossing_time = now;
-                    }
-                }
-                
-                // Sleep for poll interval
-                std::thread::sleep(poll_interval);
-            }
-            
-            log::info!("Cursor tracking thread stopped");
-            
-            // Close display
-            unsafe {
-                XCloseDisplay(display);
-            }
-        });
-        
-        (Some(handle), stop_flag)
     }
 
     pub async fn run(&mut self) -> Result<(), ServiceError> {
@@ -308,46 +159,18 @@ impl Service {
         }
 
         loop {
-            #[cfg(target_os = "linux")]
-            {
-                tokio::select! {
-                    request = self.frontend_listener.next() => self.handle_frontend_request(request),
-                    _ = self.frontend_event_pending.notified() => self.handle_frontend_pending().await,
-                    event = self.emulation.event() => self.handle_emulation_event(event),
-                    event = self.capture.event() => self.handle_capture_event(event),
-                    event = self.resolver.event() => self.handle_resolver_event(event),
-                    edge_crossing = self.edge_crossing_rx.recv() => {
-                        self.handle_edge_crossing_event(edge_crossing.expect("channel closed"));
-                    }
-                    r = signal::ctrl_c() => break r.expect("failed to wait for CTRL+C"),
-                }
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                tokio::select! {
-                    request = self.frontend_listener.next() => self.handle_frontend_request(request),
-                    _ = self.frontend_event_pending.notified() => self.handle_frontend_pending().await,
-                    event = self.emulation.event() => self.handle_emulation_event(event),
-                    event = self.capture.event() => self.handle_capture_event(event),
-                    event = self.resolver.event() => self.handle_resolver_event(event),
-                    r = signal::ctrl_c() => break r.expect("failed to wait for CTRL+C"),
-                }
+            tokio::select! {
+                request = self.frontend_listener.next() => self.handle_frontend_request(request),
+                _ = self.frontend_event_pending.notified() => self.handle_frontend_pending().await,
+                event = self.emulation.event() => self.handle_emulation_event(event),
+                event = self.capture.event() => self.handle_capture_event(event),
+                event = self.resolver.event() => self.handle_resolver_event(event),
+                r = signal::ctrl_c() => break r.expect("failed to wait for CTRL+C"),
             }
         }
 
         log::info!("terminating service ...");
-        
-        #[cfg(target_os = "linux")]
-        {
-            log::debug!("stopping cursor tracking thread ...");
-            if let Some(stop_flag) = &self.cursor_tracking_stop {
-                stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
-            if let Some(handle) = self.cursor_tracking_thread.take() {
-                let _ = handle.join();
-            }
-        }
-        
+
         log::debug!("terminating capture ...");
         self.capture.terminate().await;
         log::debug!("terminating emulation ...");
@@ -356,32 +179,6 @@ impl Service {
         self.resolver.terminate().await;
 
         Ok(())
-    }
-
-    #[cfg(target_os = "linux")]
-    fn handle_edge_crossing_event(&mut self, event: EdgeCrossingEvent) {
-        log::info!("Edge crossing event received: {:?}", event);
-        
-        // Find the incoming connection at the crossed position
-        // We need to find which incoming connection corresponds to the crossed edge
-        let incoming_addr = self.incoming_conn_info.values().find(|incoming| {
-            // Check if the incoming connection's position matches the crossed edge
-            // For example, if cursor crosses Left edge, we look for an incoming connection
-            // that entered from the Right (opposite position)
-            match event.pos {
-                Position::Left => incoming.pos == Position::Right,
-                Position::Right => incoming.pos == Position::Left,
-                Position::Top => incoming.pos == Position::Bottom,
-                Position::Bottom => incoming.pos == Position::Top,
-            }
-        }).map(|incoming| incoming.addr);
-        
-        if let Some(addr) = incoming_addr {
-            log::info!("Found incoming connection at position {:?}, sending EdgeCrossed event", event.pos);
-            self.emulation.edge_crossed(addr, event.pos);
-        } else {
-            log::debug!("No incoming connection found for edge position {:?}", event.pos);
-        }
     }
 
     fn handle_frontend_request(&mut self, request: Option<Result<FrontendRequest, IpcError>>) {
@@ -512,15 +309,6 @@ impl Service {
             EmulationEvent::ReleaseNotify => self.capture.release(),
             EmulationEvent::Connected { addr, fingerprint } => {
                 self.notify_frontend(FrontendEvent::DeviceConnected { addr, fingerprint });
-            }
-            #[cfg(target_os = "linux")]
-            EmulationEvent::EdgeCrossed { addr, pos } => {
-                log::info!("cursor crossed edge at position {:?} for connection {}", pos, addr);
-                // Send Enter event to the remote machine to notify that cursor is returning
-                if let Some(_incoming) = self.incoming_conn_info.values().find(|i| i.addr == addr) {
-                    log::info!("sending Enter event to remote machine at position {:?}", pos);
-                    self.emulation.send_enter_event(addr, pos);
-                }
             }
         }
     }

@@ -25,6 +25,8 @@ tokio = { version = "1.32.0", features = [
     "time"
 ] }
 once_cell = "1.19.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 
 [target.'cfg(all(unix, not(target_os="macos")))'.dependencies]
 bitflags = "2.6.0"
@@ -40,11 +42,13 @@ wayland-protocols-wlr = { version = "0.3.1", features = [
 wayland-protocols-misc = { version = "0.3.1", features = [
     "client",
 ], optional = true }
-x11 = { version = "2.21.0", features = ["xlib", "xtest"], optional = true }
+x11 = { version = "2.21.0", features = ["xlib", "xtest", "xinput", "xrandr"], optional = true }
 ashpd = { version = "0.11.0", default-features = false, features = [
     "tokio",
 ], optional = true }
 reis = { version = "0.5.0", features = ["tokio"], optional = true }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
 
 [target.'cfg(target_os="macos")'.dependencies]
 bitflags = "2.6.0"
@@ -70,6 +74,9 @@ wlroots = [
     "dep:wayland-protocols-wlr",
     "dep:wayland-protocols-misc",
 ]
-x11 = ["dep:x11"]
+x11 = ["dep:x11", "x11/xrandr", "x11/xinput"]
 remote_desktop_portal = ["dep:ashpd"]
 libei = ["dep:reis", "dep:ashpd"]
+
+[dev-dependencies]
+tokio-test = "0.4"

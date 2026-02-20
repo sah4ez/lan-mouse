@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use x11::{
     xlib::{self, XCloseDisplay, XQueryPointer},
     xtest,
@@ -155,7 +155,9 @@ impl X11Emulation {
                         display_env
                     );
                     log::error!("{}", error_msg);
-                    return Err(X11EmulationCreationError::OpenDisplay { display: display_env });
+                    return Err(X11EmulationCreationError::OpenDisplay {
+                        display: display_env,
+                    });
                 }
                 display => DisplayHandle::new(display),
             }
@@ -191,21 +193,29 @@ impl X11Emulation {
         // Query cursor position before applying motion
         let (before_x, before_y) = self.query_cursor_position()?;
 
-        let result = unsafe {
-            xtest::XTestFakeRelativeMotionEvent(self.display.get(), dx, dy, 0, 0)
-        };
+        let result =
+            unsafe { xtest::XTestFakeRelativeMotionEvent(self.display.get(), dx, dy, 0, 0) };
 
         if result == 0 {
             log::error!("XTestFakeRelativeMotionEvent failed");
-            return Err(EmulationError::Other("Failed to emulate motion".to_string()));
+            return Err(EmulationError::Other(
+                "Failed to emulate motion".to_string(),
+            ));
         }
 
         // Query cursor position after applying motion
         let (after_x, after_y) = self.query_cursor_position()?;
 
         if log::log_enabled!(log::Level::Trace) {
-            log::trace!("X11 emulation: relative motion applied - delta: ({}, {}), cursor position: ({}, {}) -> ({}, {})",
-                        dx, dy, before_x, before_y, after_x, after_y);
+            log::trace!(
+                "X11 emulation: relative motion applied - delta: ({}, {}), cursor position: ({}, {}) -> ({}, {})",
+                dx,
+                dy,
+                before_x,
+                before_y,
+                after_x,
+                after_y
+            );
         }
 
         Ok(())
@@ -283,18 +293,25 @@ impl X11Emulation {
             _ => 1,
         };
 
-        let result = unsafe {
-            xtest::XTestFakeButtonEvent(self.display.get(), x11_button, state as i32, 0)
-        };
+        let result =
+            unsafe { xtest::XTestFakeButtonEvent(self.display.get(), x11_button, state as i32, 0) };
 
         if result == 0 {
             log::error!("XTestFakeButtonEvent failed for button {}", x11_button);
-            return Err(EmulationError::Other(format!("Failed to emulate button {}", x11_button)));
+            return Err(EmulationError::Other(format!(
+                "Failed to emulate button {}",
+                x11_button
+            )));
         }
 
         if log::log_enabled!(log::Level::Trace) {
-            log::trace!("X11 emulation: mouse button event - button: {}, state: {}, cursor position: ({}, {})",
-                        x11_button, if state == 1 { "pressed" } else { "released" }, cursor_x, cursor_y);
+            log::trace!(
+                "X11 emulation: mouse button event - button: {}, state: {}, cursor position: ({}, {})",
+                x11_button,
+                if state == 1 { "pressed" } else { "released" },
+                cursor_x,
+                cursor_y
+            );
         }
 
         Ok(())
@@ -343,8 +360,14 @@ impl X11Emulation {
             let result2 = xtest::XTestFakeButtonEvent(self.display.get(), direction, 0, 0);
 
             if result1 == 0 || result2 == 0 {
-                log::error!("XTestFakeButtonEvent failed for scroll direction {}", direction);
-                return Err(EmulationError::Other(format!("Failed to emulate scroll direction {}", direction)));
+                log::error!(
+                    "XTestFakeButtonEvent failed for scroll direction {}",
+                    direction
+                );
+                return Err(EmulationError::Other(format!(
+                    "Failed to emulate scroll direction {}",
+                    direction
+                )));
             }
         }
 
@@ -357,8 +380,13 @@ impl X11Emulation {
         };
 
         if log::log_enabled!(log::Level::Trace) {
-            log::trace!("X11 emulation: scroll event - direction: {}, value: {}, cursor position: ({}, {})",
-                        direction_str, value, cursor_x, cursor_y);
+            log::trace!(
+                "X11 emulation: scroll event - direction: {}, value: {}, cursor position: ({}, {})",
+                direction_str,
+                value,
+                cursor_x,
+                cursor_y
+            );
         }
 
         Ok(())
@@ -386,18 +414,25 @@ impl X11Emulation {
         // X11 keycodes are shifted by 8 relative to Linux scancodes
         let x11_keycode = key + X11_KEYCODE_OFFSET;
 
-        let result = unsafe {
-            xtest::XTestFakeKeyEvent(self.display.get(), x11_keycode, state as i32, 0)
-        };
+        let result =
+            unsafe { xtest::XTestFakeKeyEvent(self.display.get(), x11_keycode, state as i32, 0) };
 
         if result == 0 {
             log::error!("XTestFakeKeyEvent failed for keycode {}", x11_keycode);
-            return Err(EmulationError::Other(format!("Failed to emulate key {}", x11_keycode)));
+            return Err(EmulationError::Other(format!(
+                "Failed to emulate key {}",
+                x11_keycode
+            )));
         }
 
         if log::log_enabled!(log::Level::Trace) {
-            log::trace!("X11 emulation: key event - keycode: {}, state: {}, cursor position: ({}, {})",
-                        x11_keycode, if state == 1 { "pressed" } else { "released" }, cursor_x, cursor_y);
+            log::trace!(
+                "X11 emulation: key event - keycode: {}, state: {}, cursor position: ({}, {})",
+                x11_keycode,
+                if state == 1 { "pressed" } else { "released" },
+                cursor_x,
+                cursor_y
+            );
         }
 
         Ok(())

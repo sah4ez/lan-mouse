@@ -1,5 +1,6 @@
 /target
 /plans
+/x2x
 
 # Rust
 **/*.rs.bk

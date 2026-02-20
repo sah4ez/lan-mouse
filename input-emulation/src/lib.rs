@@ -186,7 +186,10 @@ impl InputEmulation {
         };
 
         for backend in &backends {
-            log::info!("Attempting to create {} input emulation backend...", backend);
+            log::info!(
+                "Attempting to create {} input emulation backend...",
+                backend
+            );
             match Self::with_backend(*backend).await {
                 Ok(b) => {
                     log::info!("Successfully created emulation backend: {backend}");
@@ -200,7 +203,10 @@ impl InputEmulation {
             }
         }
 
-        log::error!("No input emulation backend available. Tried: {:?}", backends);
+        log::error!(
+            "No input emulation backend available. Tried: {:?}",
+            backends
+        );
         Err(EmulationCreationError::NoAvailableBackend)
     }
 

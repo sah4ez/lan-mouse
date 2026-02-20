@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     ptr,
-    sync::atomic::{AtomicBool, AtomicPtr, Ordering},
+    sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, Ordering},
     sync::Arc,
     task::Poll,
     thread,
@@ -10,6 +10,7 @@ use std::{
 use async_trait::async_trait;
 use futures_core::Stream;
 use tokio::sync::{mpsc, Mutex};
+use tokio::task::spawn_blocking;
 use x11::{
     xlib::{self, XCloseDisplay, XDisplayHeight, XDisplayWidth, XQueryPointer, XWarpPointer, XDefaultRootWindow, XFlush},
     xrecord::{self, XRecordInterceptData},
@@ -18,6 +19,69 @@ use x11::{
 use input_event::{Event, KeyboardEvent, PointerEvent};
 
 use super::{Capture, CaptureError, CaptureEvent, Position, error::X11InputCaptureCreationError};
+
+// ============================================================================
+// X11 Error Handler
+// ============================================================================
+
+/// X11 error handler for catching and logging X11 protocol errors
+///
+/// This prevents X11 from printing errors to stderr and allows
+/// proper error handling in the application.
+static mut X11_ERROR_HANDLER_INSTALLED: bool = false;
+
+/// X11 error handler function
+///
+/// This function is called by X11 when a protocol error occurs.
+/// It logs the error details and returns 0 to prevent X11 from
+/// printing to stderr.
+unsafe extern "C" fn x11_error_handler(
+    _display: *mut xlib::Display,
+    error_event: *mut xlib::XErrorEvent,
+) -> i32 {
+    if error_event.is_null() {
+        return 0;
+    }
+    
+    let event = &*error_event;
+    log::error!(
+        "X11 Error: type={}, serial={}, error_code={}, request_code={}, minor_code={}",
+        event.type_,
+        event.serial,
+        event.error_code,
+        event.request_code,
+        event.minor_code
+    );
+    0 // Return 0 to prevent X11 from printing to stderr
+}
+
+/// X11 I/O error handler function
+///
+/// This function is called by X11 when a fatal I/O error occurs
+/// (e.g., connection to X server lost).
+unsafe extern "C" fn x11_io_error_handler(
+    _display: *mut xlib::Display,
+) -> i32 {
+    log::error!("X11 I/O Error: display connection lost or X server terminated");
+    0 // Return 0 to prevent X11 from printing to stderr
+}
+
+/// Install X11 error handlers
+///
+/// This function installs error and I/O error handlers for the X11 connection.
+/// It should be called once during initialization.
+unsafe fn install_x11_error_handlers() {
+    // Only install once
+    if X11_ERROR_HANDLER_INSTALLED {
+        return;
+    }
+    
+    xlib::XSetErrorHandler(Some(x11_error_handler));
+    xlib::XSetIOErrorHandler(Some(x11_io_error_handler));
+    X11_ERROR_HANDLER_INSTALLED = true;
+    
+    log::debug!("X11 error handlers installed");
+}
 
 // ============================================================================
 // Constants
@@ -124,39 +188,50 @@ struct RecordCallbackClosure {
 ///
 /// This struct maintains the current and previous cursor positions atomically
 /// to prevent race conditions when detecting edge crossings.
-#[derive(Debug, Default)]
-struct CursorState {
-    current: (i32, i32),
-    previous: (i32, i32),
+#[derive(Debug)]
+struct AtomicCursorState {
+    current_x: AtomicI32,
+    current_y: AtomicI32,
+    previous_x: AtomicI32,
+    previous_y: AtomicI32,
 }
 
-impl CursorState {
-    /// Create a new CursorState with initial position
+impl AtomicCursorState {
+    /// Create a new AtomicCursorState with initial position
     fn new(initial: (i32, i32)) -> Self {
         Self {
-            current: initial,
-            previous: initial,
+            current_x: AtomicI32::new(initial.0),
+            current_y: AtomicI32::new(initial.1),
+            previous_x: AtomicI32::new(initial.0),
+            previous_y: AtomicI32::new(initial.1),
         }
     }
 
     /// Update the cursor position and return the previous position
     ///
     /// This method atomically updates the state, preventing race conditions.
-    fn update(&mut self, new_pos: (i32, i32)) -> (i32, i32) {
-        let prev = self.current;
-        self.previous = prev;
-        self.current = new_pos;
-        prev
+    fn update(&self, new_pos: (i32, i32)) -> (i32, i32) {
+        let prev_x = self.current_x.swap(new_pos.0, Ordering::AcqRel);
+        let prev_y = self.current_y.swap(new_pos.1, Ordering::AcqRel);
+        self.previous_x.store(prev_x, Ordering::Release);
+        self.previous_y.store(prev_y, Ordering::Release);
+        (prev_x, prev_y)
     }
 
     /// Get the current cursor position
     fn current(&self) -> (i32, i32) {
-        self.current
+        (
+            self.current_x.load(Ordering::Acquire),
+            self.current_y.load(Ordering::Acquire),
+        )
     }
 
     /// Get the previous cursor position
     fn previous(&self) -> (i32, i32) {
-        self.previous
+        (
+            self.previous_x.load(Ordering::Acquire),
+            self.previous_y.load(Ordering::Acquire),
+        )
     }
 }
 
@@ -183,10 +258,25 @@ impl CursorState {
 /// # Ok(())
 /// # }
 /// ```
+/// X11 input capture backend using XRecord extension
+///
+/// # Architecture Notes
+///
+/// XRecord extension requires a separate display connection from the main display.
+/// This is a requirement of the XRecord protocol and cannot be avoided.
+///
+/// Both connections share the same X server but operate independently:
+/// - `display`: Used for XQueryPointer, XWarpPointer, and other operations
+/// - `record_display`: Used exclusively for XRecord event capture
+///
+/// # Resource Usage
+///
+/// Having two display connections doubles X server connection overhead.
+/// This is acceptable given the XRecord protocol requirements.
 pub struct X11InputCapture {
-    /// X11 display connection
+    /// X11 display connection (used for XQueryPointer, XWarpPointer, etc.)
     display: SendDisplay,
-    /// XRecord display connection (separate from main display)
+    /// XRecord display connection (required by XRecord protocol, separate from main display)
     record_display: SendDisplay,
     /// XRecord context for event capture
     record_context: xrecord::XRecordContext,
@@ -195,7 +285,7 @@ pub struct X11InputCapture {
     /// Active capture positions
     active_clients: Arc<Mutex<HashSet<Position>>>,
     /// Cursor state (current and previous positions)
-    cursor_state: Arc<Mutex<CursorState>>,
+    cursor_state: Arc<AtomicCursorState>,
     /// Counter for consecutive edge positions (to detect when cursor tries to cross)
     edge_counter: Arc<Mutex<u32>>,
     /// Screen bounds
@@ -215,6 +305,11 @@ impl X11InputCapture {
     /// Create a new X11 input capture instance
     pub fn new() -> Result<Self, X11InputCaptureCreationError> {
         log::info!("Initializing X11 input capture backend");
+
+        // Install X11 error handlers
+        unsafe {
+            install_x11_error_handlers();
+        }
 
         // Check DISPLAY environment variable
         let display_env = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_string());
@@ -303,7 +398,7 @@ impl X11InputCapture {
         // Set up communication channels
         let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_BUFFER);
         let active_clients = Arc::new(Mutex::new(HashSet::new()));
-        let cursor_state = Arc::new(Mutex::new(CursorState::default()));
+        let cursor_state = Arc::new(AtomicCursorState::new((0, 0)));
         let edge_counter = Arc::new(Mutex::new(0));
         let current_pos = Arc::new(Mutex::new(None));
         let enter_position = Arc::new(Mutex::new(None));
@@ -897,10 +992,7 @@ impl X11InputCapture {
         }
 
         // Atomically update cursor state and get previous position
-        let (prev_x, prev_y) = {
-            let mut state = self.cursor_state.try_lock().ok()?;
-            state.update((root_x, root_y))
-        };
+        let (prev_x, prev_y) = self.cursor_state.update((root_x, root_y));
 
         // Check if we're currently in capture mode
         let is_capturing = self.current_pos.try_lock().ok()?.is_some();
@@ -1044,33 +1136,51 @@ impl Drop for X11InputCapture {
 impl Capture for X11InputCapture {
     async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
         log::info!("Creating capture at position: {pos}");
-        let mut clients = self.active_clients.lock().await;
-        clients.insert(pos);
+        let active_clients = Arc::clone(&self.active_clients);
+        spawn_blocking(move || {
+            let mut clients = active_clients.blocking_lock();
+            clients.insert(pos);
+        })
+        .await
+        .map_err(|e| CaptureError::Other(e.to_string()))?;
         Ok(())
     }
 
     async fn destroy(&mut self, pos: Position) -> Result<(), CaptureError> {
         log::info!("Destroying capture at position: {pos}");
-        let mut clients = self.active_clients.lock().await;
-        clients.remove(&pos);
+        let active_clients = Arc::clone(&self.active_clients);
+        spawn_blocking(move || {
+            let mut clients = active_clients.blocking_lock();
+            clients.remove(&pos);
+        })
+        .await
+        .map_err(|e| CaptureError::Other(e.to_string()))?;
         Ok(())
     }
 
     async fn release(&mut self) -> Result<(), CaptureError> {
         log::info!("X11: Releasing capture");
         // Clear capture state
-        if let Ok(mut current) = self.current_pos.try_lock() {
-            log::debug!("Clearing current capture position");
-            log::trace!("X11: Current capture position was: {:?}", *current);
-            *current = None;
-            log::trace!("X11: Current capture position cleared, cursor is no longer constrained");
-        }
-        if let Ok(mut pos) = self.enter_position.try_lock() {
-            log::debug!("Clearing enter position");
-            log::trace!("X11: Enter position was: {:?}", *pos);
-            *pos = None;
-            log::trace!("X11: Enter position cleared, cursor will not be reset on next capture");
-        }
+        let current_pos = Arc::clone(&self.current_pos);
+        let enter_position = Arc::clone(&self.enter_position);
+        
+        spawn_blocking(move || {
+            if let Ok(mut current) = current_pos.try_lock() {
+                log::debug!("Clearing current capture position");
+                log::trace!("X11: Current capture position was: {:?}", *current);
+                *current = None;
+                log::trace!("X11: Current capture position cleared, cursor is no longer constrained");
+            }
+            if let Ok(mut pos) = enter_position.try_lock() {
+                log::debug!("Clearing enter position");
+                log::trace!("X11: Enter position was: {:?}", *pos);
+                *pos = None;
+                log::trace!("X11: Enter position cleared, cursor will not be reset on next capture");
+            }
+        })
+        .await
+        .map_err(|e| CaptureError::Other(e.to_string()))?;
+        
         log::debug!("X11: Capture released, cursor can now move freely");
         Ok(())
     }
@@ -1096,9 +1206,7 @@ impl Stream for X11InputCapture {
             }
 
             // Get current cursor position
-            let (root_x, root_y) = self.cursor_state.try_lock()
-                .map(|state| state.current())
-                .unwrap_or((0, 0));
+            let (root_x, root_y) = self.cursor_state.current();
 
             if log::log_enabled!(log::Level::Trace) {
                 log::trace!("X11: poll_next - starting capture at position {:?} with cursor at ({}, {})", pos, root_x, root_y);

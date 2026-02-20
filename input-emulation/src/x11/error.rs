@@ -30,6 +30,9 @@ pub enum X11EmulationError {
 
     #[error("display is invalid or closed")]
     InvalidDisplay,
+
+    #[error("XTest extension is not available on this X server")]
+    XTestNotAvailable,
 }
 
 /// Result type for X11 operations

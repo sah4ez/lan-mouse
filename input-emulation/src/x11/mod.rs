@@ -13,29 +13,22 @@ pub mod transform;
 mod tests;
 
 // Re-export public types from all modules
-pub use cursor::{CursorManager, CursorPosition, EdgeConfig, EdgeDetector, Position};
+pub use cursor::{CursorManager, EdgeConfig};
 pub use display::X11DisplayHandle;
-pub use error::{ErrorContext, X11EmulationError, X11Result};
-pub use keyboard::{KeyEventResult, KeyboardState, ModifierState, ScancodeMapper, emulate_key};
-pub use logging::{init_tracing, targets, timed};
-pub use mouse::{ButtonMapper, ButtonState, button_name, buttons, emulate_button};
-pub use network::{
-    EventBatch, LatencyConfig, NetworkEvent, NetworkEventData, NetworkEventType, create_batch,
-    deserialize_event, serialize_event,
-};
-pub use screen::{MonitorInfo, Rect, ScreenConfig, XRandRConfig, query_screen_config};
-pub use scroll::{ScrollConfig, ScrollDirection, ScrollEvent, axis_name, emulate_scroll};
+pub use error::{X11EmulationError, X11Result};
+pub use keyboard::{KeyEventResult, KeyboardState, ScancodeMapper, emulate_key};
+pub use mouse::{ButtonMapper, ButtonState, emulate_button};
+pub use scroll::{ScrollConfig, ScrollEvent, emulate_scroll};
 pub use transform::CoordinateTransformer;
 
 use async_trait::async_trait;
-use std::sync::Arc;
 
 use input_event::{
-    BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent, PointerEvent,
+    Event, KeyboardEvent, PointerEvent,
 };
 
 use crate::{
-    Emulation, EmulationCreationError, EmulationError, EmulationHandle,
+    Emulation, EmulationError, EmulationHandle,
     error::X11EmulationCreationError,
 };
 
@@ -86,6 +79,11 @@ impl X11Emulation {
     pub fn new() -> Result<Self, X11EmulationCreationError> {
         tracing::info!(target: "x11::display", "Initializing X11 input emulation backend");
 
+        // Install X11 error handlers
+        unsafe {
+            display::install_x11_error_handlers();
+        }
+
         // Проверяем переменную окружения DISPLAY
         let display_env = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_string());
         tracing::info!(target: "x11::display", "Using DISPLAY: {}", display_env);
@@ -108,6 +106,42 @@ impl X11Emulation {
                 display => X11DisplayHandle::new(display),
             }
         };
+
+        // Проверяем доступность XTest расширения
+        tracing::debug!(target: "x11::display", "Checking XTest extension availability");
+        let (xtest_available, major, minor) = unsafe {
+            let mut event_base = 0;
+            let mut error_base = 0;
+            let mut major = 0;
+            let mut minor = 0;
+            let available = x11::xtest::XTestQueryExtension(
+                display.get(),
+                &mut event_base,
+                &mut error_base,
+                &mut major,
+                &mut minor,
+            ) != 0;
+            (available, major, minor)
+        };
+
+        if !xtest_available {
+            tracing::error!(
+                target: "x11::display",
+                "XTest extension is not available on this X server. \
+                This extension is required for input emulation on X11. \
+                Please ensure your X server has the XTest extension enabled."
+            );
+            unsafe {
+                display.close();
+            }
+            return Err(X11EmulationCreationError::XTestNotAvailable);
+        }
+
+        tracing::info!(
+            target: "x11::display",
+            "XTest extension available: version {}.{}",
+            major, minor
+        );
 
         // Запрашиваем конфигурацию экрана
         let screen_config = screen::query_screen_config(&display).map_err(|e| {

@@ -1,8 +1,72 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
-use x11::xlib::{self, XCloseDisplay};
+use x11::xlib::{self, XCloseDisplay, XErrorEvent};
 
 use super::error::{X11EmulationError, X11Result};
+
+// ============================================================================
+// X11 Error Handler
+// ============================================================================
+
+/// Flag to track if error handlers have been installed
+static mut X11_ERROR_HANDLER_INSTALLED: bool = false;
+
+/// X11 error handler function
+///
+/// This function is called by X11 when a protocol error occurs.
+/// It logs the error details and returns 0 to prevent X11 from
+/// printing to stderr.
+unsafe extern "C" fn x11_error_handler(
+    _display: *mut x11::xlib::Display,
+    error_event: *mut XErrorEvent,
+) -> i32 {
+    if error_event.is_null() {
+        return 0;
+    }
+    
+    let event = &*error_event;
+    tracing::error!(
+        target: "x11::error",
+        "X11 Error: type={}, serial={}, error_code={}, request_code={}, minor_code={}",
+        event.type_,
+        event.serial,
+        event.error_code,
+        event.request_code,
+        event.minor_code
+    );
+    0 // Return 0 to prevent X11 from printing to stderr
+}
+
+/// X11 I/O error handler function
+///
+/// This function is called by X11 when a fatal I/O error occurs
+/// (e.g., connection to X server lost).
+unsafe extern "C" fn x11_io_error_handler(
+    _display: *mut x11::xlib::Display,
+) -> i32 {
+    tracing::error!(
+        target: "x11::error",
+        "X11 I/O Error: display connection lost or X server terminated"
+    );
+    0 // Return 0 to prevent X11 from printing to stderr
+}
+
+/// Install X11 error handlers
+///
+/// This function installs error and I/O error handlers for the X11 connection.
+/// It should be called once during initialization.
+pub(crate) unsafe fn install_x11_error_handlers() {
+    // Only install once
+    if X11_ERROR_HANDLER_INSTALLED {
+        return;
+    }
+    
+    x11::xlib::XSetErrorHandler(Some(x11_error_handler));
+    x11::xlib::XSetIOErrorHandler(Some(x11_io_error_handler));
+    X11_ERROR_HANDLER_INSTALLED = true;
+    
+    tracing::debug!(target: "x11::display", "X11 error handlers installed");
+}
 
 /// Safe wrapper for X11 Display pointer
 ///

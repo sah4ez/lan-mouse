@@ -151,6 +151,8 @@ pub enum X11EmulationCreationError {
     OpenDisplay { display: String },
     #[error("X11 emulation error: {message}")]
     Other { message: String },
+    #[error("XTest extension is not available")]
+    XTestNotAvailable,
 }
 
 #[cfg(target_os = "macos")]

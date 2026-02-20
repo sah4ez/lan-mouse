@@ -1,6 +1,6 @@
 use crate::x11::{
     X11EmulationError, X11Result,
-    screen::{MonitorInfo, Rect, ScreenConfig},
+    screen::{MonitorInfo, ScreenConfig},
 };
 
 /// Coordinate transformer

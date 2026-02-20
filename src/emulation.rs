@@ -23,6 +23,31 @@ pub(crate) struct Emulation {
     event_rx: Receiver<EmulationEvent>,
 }
 
+impl Emulation {
+    pub(crate) fn set_entry_edge(&self, position: lan_mouse_ipc::Position) {
+        // Calculate the opposite edge where cursor will exit
+        let exit_edge = position.opposite();
+        log::info!(
+            "Emulation::set_entry_edge: === SETTING ENTRY EDGE ==="
+        );
+        log::info!(
+            "Emulation::set_entry_edge: entry_side={:?} | exit_side={:?} | source=ProtoEvent::Enter",
+            position,
+            exit_edge
+        );
+        self.request_tx
+            .send(EmulationRequest::SetEntryEdge(position))
+            .expect("channel closed");
+    }
+
+    pub(crate) fn clear_entry_edge(&self) {
+        log::info!("Emulation::clear_entry_edge: entry edge cleared, cursor can exit through any edge");
+        self.request_tx
+            .send(EmulationRequest::ClearEntryEdge)
+            .expect("channel closed");
+    }
+}
+
 pub(crate) enum EmulationEvent {
     Connected {
         addr: SocketAddr,
@@ -52,6 +77,8 @@ pub(crate) enum EmulationEvent {
     EmulationEnabled,
     /// capture should be released
     ReleaseNotify,
+    /// cursor crossed screen edge, should send Leave to client
+    EdgeCrossed,
 }
 
 enum EmulationRequest {
@@ -59,6 +86,8 @@ enum EmulationRequest {
     Release(SocketAddr),
     ChangePort(u16),
     Terminate,
+    SetEntryEdge(lan_mouse_ipc::Position),
+    ClearEntryEdge,
 }
 
 impl Emulation {
@@ -138,11 +167,14 @@ impl ListenTask {
                         last_response.insert(addr, Instant::now());
                         match event {
                             ProtoEvent::Enter(pos) => {
+                                log::info!("ProtoEvent::Enter received with pos={:?}", pos);
                                 if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
                                     log::info!("releasing capture: {addr} entered this device");
                                     self.event_tx.send(EmulationEvent::ReleaseNotify).expect("channel closed");
                                     self.listener.reply(addr, ProtoEvent::Ack(0)).await;
                                     self.event_tx.send(EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint}).expect("channel closed");
+                                } else {
+                                    log::warn!("ProtoEvent::Enter: no certificate fingerprint for {addr}");
                                 }
                             }
                             ProtoEvent::Leave(_) => {
@@ -179,6 +211,8 @@ impl ListenTask {
                         self.event_tx.send(EmulationEvent::PortChanged(result)).expect("channel closed");
                     }
                     EmulationRequest::Terminate => break,
+                    EmulationRequest::SetEntryEdge(position) => self.emulation_proxy.set_entry_edge(position),
+                    EmulationRequest::ClearEntryEdge => self.emulation_proxy.clear_entry_edge(),
                 },
                 _ = interval.tick() => {
                     last_response.retain(|&addr,instant| {
@@ -191,6 +225,8 @@ impl ListenTask {
                             true
                         }
                     });
+                    // Periodically check for edge crossings
+                    self.emulation_proxy.check_edge();
                 }
             }
         }
@@ -214,6 +250,9 @@ enum ProxyRequest {
     Remove(SocketAddr),
     Terminate,
     Reenable,
+    CheckEdge,
+    SetEntryEdge(lan_mouse_ipc::Position),
+    ClearEntryEdge,
 }
 
 impl EmulationProxy {
@@ -280,6 +319,26 @@ impl EmulationProxy {
             .expect("channel closed");
     }
 
+    fn check_edge(&self) {
+        self.request_tx
+            .send(ProxyRequest::CheckEdge)
+            .expect("channel closed");
+    }
+
+    fn set_entry_edge(&self, position: lan_mouse_ipc::Position) {
+        log::info!("EmulationProxy::set_entry_edge called with position={:?}", position);
+        self.request_tx
+            .send(ProxyRequest::SetEntryEdge(position))
+            .expect("channel closed");
+    }
+
+    fn clear_entry_edge(&self) {
+        log::info!("EmulationProxy::clear_entry_edge called");
+        self.request_tx
+            .send(ProxyRequest::ClearEntryEdge)
+            .expect("channel closed");
+    }
+
     async fn terminate(&mut self) {
         self.exit_requested.replace(true);
         self.request_tx
@@ -314,6 +373,9 @@ impl EmulationTask {
                     ProxyRequest::Terminate => return,
                     ProxyRequest::Input(..) => { /* emulation inactive => ignore */ }
                     ProxyRequest::Remove(..) => { /* emulation inactive => ignore */ }
+                    ProxyRequest::CheckEdge => { /* emulation inactive => ignore */ }
+                    ProxyRequest::SetEntryEdge(_) => { /* emulation inactive => ignore */ }
+                    ProxyRequest::ClearEntryEdge => { /* emulation inactive => ignore */ }
                 }
             }
         }
@@ -381,6 +443,11 @@ impl EmulationTask {
                             }
                         };
                         emulation.consume(event, handle).await?;
+                        // Check for edge crossings after consuming each input event
+                        if emulation.check_edge_crossing().await.is_some() {
+                            log::info!("cursor crossed screen edge");
+                            self.event_tx.send(EmulationEvent::EdgeCrossed).expect("channel closed");
+                        }
                     },
                     ProxyRequest::Remove(addr) => {
                         if let Some(handle) = self.handles.remove(&addr) {
@@ -390,6 +457,21 @@ impl EmulationTask {
                     }
                     ProxyRequest::Terminate => break Ok(()),
                     ProxyRequest::Reenable => continue,
+                    ProxyRequest::CheckEdge => {
+                        // Check if cursor has crossed a screen edge
+                        if emulation.check_edge_crossing().await.is_some() {
+                            log::info!("cursor crossed screen edge");
+                            self.event_tx.send(EmulationEvent::EdgeCrossed).expect("channel closed");
+                        }
+                    }
+                    ProxyRequest::SetEntryEdge(position) => {
+                        // Set the entry edge when a client enters
+                        emulation.set_entry_edge(position).await;
+                    }
+                    ProxyRequest::ClearEntryEdge => {
+                        // Clear the entry edge when a client leaves
+                        emulation.clear_entry_edge().await;
+                    }
                 },
             }
         }
@@ -412,6 +494,9 @@ async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>) {
             ProxyRequest::Input(_, _) => continue,
             ProxyRequest::Remove(_) => continue,
             ProxyRequest::Reenable => continue,
+            ProxyRequest::CheckEdge => continue,
+            ProxyRequest::SetEntryEdge(_) => continue,
+            ProxyRequest::ClearEntryEdge => continue,
         }
     }
 }

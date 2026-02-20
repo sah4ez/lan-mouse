@@ -284,6 +284,22 @@ impl InputEmulation {
             .is_some_and(|p| !p.is_empty())
     }
 
+    /// Check if the cursor has crossed a screen edge
+    /// Returns Some(()) if an edge was crossed, None otherwise
+    pub async fn check_edge_crossing(&mut self) -> Option<()> {
+        self.emulation.check_edge_crossing().await
+    }
+
+    /// Set the entry edge when a client enters from a specific direction
+    pub async fn set_entry_edge(&mut self, position: lan_mouse_ipc::Position) {
+        self.emulation.set_entry_edge(position).await;
+    }
+
+    /// Clear the entry edge when a client leaves
+    pub async fn clear_entry_edge(&mut self) {
+        self.emulation.clear_entry_edge().await;
+    }
+
     /// update the pressed_keys for the given handle
     /// returns whether the event should be processed
     fn update_pressed_keys(&mut self, handle: EmulationHandle, key: u32, state: u8) -> bool {
@@ -311,4 +327,16 @@ trait Emulation: Send {
     async fn create(&mut self, handle: EmulationHandle);
     async fn destroy(&mut self, handle: EmulationHandle);
     async fn terminate(&mut self);
+    
+    /// Check if the cursor has crossed a screen edge
+    /// Returns Some(edge_position) if an edge was crossed, None otherwise
+    async fn check_edge_crossing(&mut self) -> Option<()> {
+        None
+    }
+
+    /// Set the entry edge when a client enters from a specific direction
+    async fn set_entry_edge(&mut self, position: lan_mouse_ipc::Position);
+
+    /// Clear the entry edge when a client leaves
+    async fn clear_entry_edge(&mut self);
 }

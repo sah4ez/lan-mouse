@@ -252,6 +252,11 @@ pub fn query_screen_config(display: &X11DisplayHandle) -> X11Result<ScreenConfig
 /// Query monitor information via XRandR
 #[allow(dead_code)] // Will be used in future steps
 unsafe fn query_xrandr_monitors(display: &X11DisplayHandle) -> X11Result<Vec<MonitorInfo>> {
+    // Validate display before use (HIGH PRIORITY: prevents use-after-free)
+    if !display.is_valid() {
+        return Err(X11EmulationError::InvalidDisplay);
+    }
+    
     // Check for XRandR availability
     let mut major = 0;
     let mut minor = 0;
@@ -295,10 +300,37 @@ unsafe fn query_xrandr_monitors(display: &X11DisplayHandle) -> X11Result<Vec<Mon
     let mut monitors = Vec::new();
     for i in 0..n_monitors {
         let monitor = *monitors_ptr.offset(i as isize);
-        let name = unsafe {
-            std::ffi::CStr::from_ptr(monitor.name as *const u8)
-                .to_string_lossy()
-                .into_owned()
+
+        // CRITICAL FIX: monitor.name is an X11 Atom (32-bit identifier), not a pointer
+        // We need to use XGetAtomName to get the actual string representation
+        let name = if monitor.name == 0 {
+            tracing::warn!(
+                target: "x11::screen",
+                index = i,
+                "monitor name atom is None (0), using default name"
+            );
+            format!("monitor-{}", i)
+        } else {
+            // Use XGetAtomName to convert Atom to string
+            unsafe {
+                let atom_name_ptr = x11::xlib::XGetAtomName(display.get(), monitor.name as x11::xlib::Atom);
+                if atom_name_ptr.is_null() {
+                    tracing::warn!(
+                        target: "x11::screen",
+                        index = i,
+                        atom = monitor.name,
+                        "XGetAtomName returned null, using default name"
+                    );
+                    format!("monitor-{}", i)
+                } else {
+                    // Convert C string to Rust string
+                    let c_str = std::ffi::CStr::from_ptr(atom_name_ptr);
+                    let name = c_str.to_string_lossy().into_owned();
+                    // Free the string allocated by XGetAtomName
+                    x11::xlib::XFree(atom_name_ptr as *mut _);
+                    name
+                }
+            }
         };
 
         let geometry = Rect::new(

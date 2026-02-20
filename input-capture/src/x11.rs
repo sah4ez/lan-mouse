@@ -103,6 +103,12 @@ const EVENT_CHANNEL_BUFFER: usize = 100;
 /// XRecord version requirement
 const XRECORD_REQUIRED_VERSION: &'static str = "1.13";
 
+/// XRecord event buffer sizes (in bytes)
+/// These are the minimum required sizes for each event type
+const XRECORD_KEY_EVENT_SIZE: u64 = 2;  // event_type (1) + keycode (1)
+const XRECORD_BUTTON_EVENT_SIZE: u64 = 2;  // event_type (1) + button (1)
+const XRECORD_MOTION_EVENT_SIZE: u64 = 5;  // event_type (1) + x (2) + y (2)
+
 /// Wrapper for X11 display pointer that is Send-safe
 ///
 /// X11 display pointers are not thread-safe, but we need to send them across threads
@@ -633,20 +639,51 @@ impl X11InputCapture {
         }
 
         let event_data = data.data;
+        
+        // Validate buffer size before dereferencing
+        if data.data_len < 1 {
+            log::warn!("XRecord callback: data_len is 0, cannot read event_type");
+            return;
+        }
+        
         let event_type = *(event_data as *const u8);
 
         log::trace!("XRecord callback: event_type = {}", event_type);
 
         match event_type as i32 {
             xlib::KeyPress | xlib::KeyRelease => {
+                // Validate buffer size for keyboard event
+                if data.data_len < XRECORD_KEY_EVENT_SIZE {
+                    log::warn!(
+                        "XRecord callback: insufficient data for keyboard event: got {} bytes, need {} bytes",
+                        data.data_len, XRECORD_KEY_EVENT_SIZE
+                    );
+                    return;
+                }
                 log::debug!("XRecord callback: processing keyboard event, type = {}", event_type);
                 Self::process_keyboard_event(&closure.event_tx, event_data, event_type, &closure.active_clients);
             }
             xlib::ButtonPress | xlib::ButtonRelease => {
+                // Validate buffer size for button event
+                if data.data_len < XRECORD_BUTTON_EVENT_SIZE {
+                    log::warn!(
+                        "XRecord callback: insufficient data for button event: got {} bytes, need {} bytes",
+                        data.data_len, XRECORD_BUTTON_EVENT_SIZE
+                    );
+                    return;
+                }
                 log::trace!("XRecord callback: processing button event, type = {}", event_type);
                 Self::process_button_event(&closure.event_tx, event_data, event_type);
             }
             xlib::MotionNotify => {
+                // Validate buffer size for motion event
+                if data.data_len < XRECORD_MOTION_EVENT_SIZE {
+                    log::warn!(
+                        "XRecord callback: insufficient data for motion event: got {} bytes, need {} bytes",
+                        data.data_len, XRECORD_MOTION_EVENT_SIZE
+                    );
+                    return;
+                }
                 log::trace!("XRecord callback: processing motion event");
                 Self::process_motion_event(closure.display.clone(), &closure.event_tx, event_data);
             }
@@ -668,6 +705,12 @@ impl X11InputCapture {
         event_type: u8,
         active_clients: &Arc<Mutex<HashSet<Position>>>,
     ) {
+        // Validate pointer before dereferencing
+        if event_data.is_null() {
+            log::error!("XRecord: process_keyboard_event - event_data is null");
+            return;
+        }
+        
         let keycode = *(event_data.offset(1) as *const u8);
         let state = if event_type as i32 == xlib::KeyPress { 1 } else { 0 };
 
@@ -746,6 +789,12 @@ impl X11InputCapture {
         event_data: *const u8,
         event_type: u8,
     ) {
+        // Validate pointer before dereferencing
+        if event_data.is_null() {
+            log::error!("XRecord: process_button_event - event_data is null");
+            return;
+        }
+        
         let button = *(event_data.offset(1) as *const u8);
         let state = if event_type as i32 == xlib::ButtonPress { 1 } else { 0 };
 
@@ -779,6 +828,12 @@ impl X11InputCapture {
         event_tx: &mpsc::Sender<Result<(Position, CaptureEvent), CaptureError>>,
         event_data: *const u8,
     ) {
+        // Validate pointer before dereferencing
+        if event_data.is_null() {
+            log::error!("XRecord: process_motion_event - event_data is null");
+            return;
+        }
+        
         let x = *(event_data.offset(1) as *const i16) as i32;
         let y = *(event_data.offset(3) as *const i16) as i32;
 
@@ -834,6 +889,11 @@ impl X11InputCapture {
     /// This function is unsafe because it calls XQueryPointer which is an FFI function.
     /// The caller must ensure that the display pointer is valid.
     unsafe fn query_cursor_position(display: SendDisplay) -> Result<(i32, i32), String> {
+        // Validate display before use
+        if !display.is_valid() {
+            return Err("Display is not valid (closed or null)".to_string());
+        }
+        
         let mut root_x: i32 = 0;
         let mut root_y: i32 = 0;
         let mut win_x: i32 = 0;
@@ -878,6 +938,13 @@ impl X11InputCapture {
         log::trace!("X11: warp_cursor - warping cursor to ({}, {})", x, y);
         log::trace!("X11: warp_cursor - screen bounds: {}x{}, target position within bounds: x=[0, {}], y=[0, {}]",
                     self.screen_width, self.screen_height, self.screen_width - 1, self.screen_height - 1);
+        
+        // Validate display before use
+        if !self.display.is_valid() {
+            log::error!("X11: warp_cursor - display is not valid, cannot warp cursor");
+            return;
+        }
+        
         unsafe {
             let root_window = XDefaultRootWindow(self.display.get());
             XWarpPointer(
@@ -925,11 +992,33 @@ impl X11InputCapture {
         log::info!("X11: Starting capture at position: {:?}, cursor position: ({}, {})", position, root_x, root_y);
         log::trace!("X11: Screen dimensions: {}x{}", self.screen_width, self.screen_height);
 
-        // Save the current cursor position
+        // Calculate safe enter position - offset from edge to prevent infinite loop
+        // If cursor is at edge, save position slightly away from edge
+        let safe_offset = 10; // pixels away from edge
+        let (enter_x, enter_y) = match position {
+            Position::Left => {
+                // If at left edge, save position slightly to the right
+                (safe_offset.max(root_x), root_y)
+            }
+            Position::Right => {
+                // If at right edge, save position slightly to the left
+                ((self.screen_width - 1 - safe_offset).min(root_x), root_y)
+            }
+            Position::Top => {
+                // If at top edge, save position slightly below
+                (root_x, safe_offset.max(root_y))
+            }
+            Position::Bottom => {
+                // If at bottom edge, save position slightly above
+                (root_x, (self.screen_height - 1 - safe_offset).min(root_y))
+            }
+        };
+
+        // Save the safe enter position (not at edge)
         if let Ok(mut pos) = self.enter_position.try_lock() {
-            *pos = Some((root_x, root_y));
-            log::debug!("Saved enter position: ({}, {})", root_x, root_y);
-            log::trace!("X11: Enter position saved, cursor will return to ({}, {}) when capture is released", root_x, root_y);
+            *pos = Some((enter_x, enter_y));
+            log::debug!("Saved enter position: ({}, {}) (original: ({}, {}))", enter_x, enter_y, root_x, root_y);
+            log::trace!("X11: Enter position saved, cursor will return to ({}, {}) when capture is released", enter_x, enter_y);
         }
 
         // Set current capture position
@@ -961,6 +1050,12 @@ impl X11InputCapture {
     /// * `Some(position)` - The edge that was crossed
     /// * `None` - No edge was crossed
     fn check_edge_crossing(&self) -> Option<Position> {
+        // Validate display before use
+        if !self.display.is_valid() {
+            log::error!("X11: check_edge_crossing - display is not valid");
+            return None;
+        }
+        
         // Query current cursor position
         let (root_x, root_y) = unsafe {
             let mut root_x: i32 = 0;
@@ -1021,17 +1116,74 @@ impl X11InputCapture {
         let at_top_edge = root_y <= 0;
         let at_bottom_edge = root_y >= self.screen_height - 1;
 
-        // Check if cursor is at any edge
+        // Check which edge we're at (if any)
+        let edge_position = if at_left_edge {
+            Some(Position::Left)
+        } else if at_right_edge {
+            Some(Position::Right)
+        } else if at_top_edge {
+            Some(Position::Top)
+        } else if at_bottom_edge {
+            Some(Position::Bottom)
+        } else {
+            None
+        };
+
+        // Check if this edge is an active capture position
+        // Only trigger capture if the edge is configured as a client
+        let should_capture = if let Some(edge) = edge_position {
+            if let Ok(clients) = self.active_clients.try_lock() {
+                clients.contains(&edge)
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if log::log_enabled!(log::Level::Trace) {
+            if let Some(edge) = edge_position {
+                log::trace!("X11: Cursor at edge {:?}, should_capture: {}, active_clients: {:?}", 
+                            edge, should_capture, 
+                            self.active_clients.try_lock().map(|c| c.clone()).unwrap_or_default());
+            }
+        }
+
+        // Check if cursor is at any edge AND should trigger capture
         if at_left_edge || at_right_edge || at_top_edge || at_bottom_edge {
+            // Prevent edge detection if cursor just entered from this edge
+            // This prevents immediate edge crossing after cursor enters from a client
+            let just_entered = if let Ok(guard) = self.current_pos.try_lock() {
+                guard.as_ref().map(|pos| {
+                    // Check if we're at the same edge as current capture position
+                    match pos {
+                        Position::Left if at_left_edge => true,
+                        Position::Right if at_right_edge => true,
+                        Position::Top if at_top_edge => true,
+                        Position::Bottom if at_bottom_edge => true,
+                        _ => false,
+                    }
+                }).unwrap_or(false)
+            } else {
+                false
+            };
+            
+            if just_entered {
+                if log::log_enabled!(log::Level::Debug) {
+                    log::debug!("X11: Cursor just entered from this edge, skipping edge detection");
+                }
+                return None;
+            }
+            
             // Increment edge counter
             if let Ok(mut counter) = self.edge_counter.try_lock() {
                 *counter += 1;
                 if log::log_enabled!(log::Level::Trace) {
                     log::trace!("X11: Cursor at edge, counter: {}, pos: ({}, {})", *counter, root_x, root_y);
                 }
-
-                // If counter reaches threshold, trigger edge crossing
-                if *counter >= EDGE_COUNTER_THRESHOLD {
+                
+                // If counter reaches threshold AND edge is active, trigger edge crossing
+                if *counter >= EDGE_COUNTER_THRESHOLD && should_capture {
                     // Determine which edge and return
                     if at_left_edge {
                         log::info!("X11: Cursor crossed left edge at ({}, {}), preparing to return to client", root_x, root_y);
@@ -1065,30 +1217,67 @@ impl X11InputCapture {
         }
 
         // Also detect edge crossing when cursor moves towards edge
+        // Only trigger capture if the edge is in active_clients
         if root_x <= 0 && prev_x > 0 {
-            log::info!("X11: Cursor crossed left edge at ({}, {}) from ({}, {}), preparing to return to client", root_x, root_y, prev_x, prev_y);
-            if log::log_enabled!(log::Level::Trace) {
-                log::trace!("X11: Edge check - left edge crossed (x={}, prev_x={})", root_x, prev_x);
+            // Check if left edge is active
+            let should_capture = if let Ok(clients) = self.active_clients.try_lock() {
+                clients.contains(&Position::Left)
+            } else {
+                false
+            };
+            
+            if should_capture {
+                log::info!("X11: Cursor crossed left edge at ({}, {}) from ({}, {}), preparing to return to client", root_x, root_y, prev_x, prev_y);
+                if log::log_enabled!(log::Level::Trace) {
+                    log::trace!("X11: Edge check - left edge crossed (x={}, prev_x={})", root_x, prev_x);
+                }
+                return Some(Position::Left);
             }
-            return Some(Position::Left);
         } else if root_x >= self.screen_width - 1 && root_x > prev_x {
-            log::info!("X11: Cursor crossed right edge at ({}, {}) from ({}, {}), preparing to return to client", root_x, root_y, prev_x, prev_y);
-            if log::log_enabled!(log::Level::Trace) {
-                log::trace!("X11: Edge check - right edge crossed (x={}, prev_x={}, threshold={})", root_x, prev_x, self.screen_width - 1);
+            // Check if right edge is active
+            let should_capture = if let Ok(clients) = self.active_clients.try_lock() {
+                clients.contains(&Position::Right)
+            } else {
+                false
+            };
+            
+            if should_capture {
+                log::info!("X11: Cursor crossed right edge at ({}, {}) from ({}, {}), preparing to return to client", root_x, root_y, prev_x, prev_y);
+                if log::log_enabled!(log::Level::Trace) {
+                    log::trace!("X11: Edge check - right edge crossed (x={}, prev_x={}, threshold={})", root_x, prev_x, self.screen_width - 1);
+                }
+                return Some(Position::Right);
             }
-            return Some(Position::Right);
         } else if root_y <= 0 && prev_y > 0 {
-            log::info!("X11: Cursor crossed top edge at ({}, {}) from ({}, {}), preparing to return to client", root_x, root_y, prev_x, prev_y);
-            if log::log_enabled!(log::Level::Trace) {
-                log::trace!("X11: Edge check - top edge crossed (y={}, prev_y={})", root_y, prev_y);
+            // Check if top edge is active
+            let should_capture = if let Ok(clients) = self.active_clients.try_lock() {
+                clients.contains(&Position::Top)
+            } else {
+                false
+            };
+            
+            if should_capture {
+                log::info!("X11: Cursor crossed top edge at ({}, {}) from ({}, {}), preparing to return to client", root_x, root_y, prev_x, prev_y);
+                if log::log_enabled!(log::Level::Trace) {
+                    log::trace!("X11: Edge check - top edge crossed (y={}, prev_y={})", root_y, prev_y);
+                }
+                return Some(Position::Top);
             }
-            return Some(Position::Top);
         } else if root_y >= self.screen_height - 1 && root_y > prev_y {
-            log::info!("X11: Cursor crossed bottom edge at ({}, {}) from ({}, {}), preparing to return to client", root_x, root_y, prev_x, prev_y);
-            if log::log_enabled!(log::Level::Trace) {
-                log::trace!("X11: Edge check - bottom edge crossed (y={}, prev_y={}, threshold={})", root_y, prev_y, self.screen_height - 1);
+            // Check if bottom edge is active
+            let should_capture = if let Ok(clients) = self.active_clients.try_lock() {
+                clients.contains(&Position::Bottom)
+            } else {
+                false
+            };
+            
+            if should_capture {
+                log::info!("X11: Cursor crossed bottom edge at ({}, {}) from ({}, {}), preparing to return to client", root_x, root_y, prev_x, prev_y);
+                if log::log_enabled!(log::Level::Trace) {
+                    log::trace!("X11: Edge check - bottom edge crossed (y={}, prev_y={}, threshold={})", root_y, prev_y, self.screen_height - 1);
+                }
+                return Some(Position::Bottom);
             }
-            return Some(Position::Bottom);
         }
 
         if log::log_enabled!(log::Level::Trace) {
@@ -1102,10 +1291,10 @@ impl Drop for X11InputCapture {
     fn drop(&mut self) {
         log::info!("Cleaning up X11 input capture");
 
-        // Signal the XRecord thread to shutdown
+        // Signal the XRecord thread to shutdown FIRST
         self.shutdown_flag.store(true, Ordering::Release);
 
-        // Disable XRecord context
+        // Disable XRecord context to stop new events
         if self.record_context != 0 {
             unsafe {
                 xrecord::XRecordDisableContext(self.record_display.get(), self.record_context);
@@ -1113,19 +1302,21 @@ impl Drop for X11InputCapture {
             }
         }
 
-        // Close displays using the safe close method
+        // Wait for XRecord thread to finish BEFORE closing displays
+        // This prevents use-after-free if the thread is still using the display
+        if let Some(handle) = self.record_thread.take() {
+            if !handle.is_finished() {
+                log::debug!("Waiting for XRecord thread to finish...");
+                // Give the thread 2 seconds to gracefully shutdown
+                let _ = handle.join();
+                log::debug!("XRecord thread finished");
+            }
+        }
+
+        // Now it's safe to close displays
         unsafe {
             self.record_display.close();
             self.display.close();
-        }
-
-        // Join thread with timeout
-        if let Some(handle) = self.record_thread.take() {
-            // Give the thread 2 seconds to gracefully shutdown
-            if !handle.is_finished() {
-                log::debug!("Waiting for XRecord thread to finish...");
-                let _ = handle.join();
-            }
         }
 
         log::info!("X11 input capture cleanup complete");
@@ -1163,6 +1354,7 @@ impl Capture for X11InputCapture {
         // Clear capture state
         let current_pos = Arc::clone(&self.current_pos);
         let enter_position = Arc::clone(&self.enter_position);
+        let edge_counter = Arc::clone(&self.edge_counter);
         
         spawn_blocking(move || {
             if let Ok(mut current) = current_pos.try_lock() {
@@ -1176,6 +1368,14 @@ impl Capture for X11InputCapture {
                 log::trace!("X11: Enter position was: {:?}", *pos);
                 *pos = None;
                 log::trace!("X11: Enter position cleared, cursor will not be reset on next capture");
+            }
+            // CRITICAL FIX: Reset edge counter when capture is released
+            // This prevents edge counter from accumulating across capture sessions
+            if let Ok(mut counter) = edge_counter.try_lock() {
+                if *counter > 0 {
+                    log::debug!("Resetting edge counter from {} to 0", *counter);
+                    *counter = 0;
+                }
             }
         })
         .await

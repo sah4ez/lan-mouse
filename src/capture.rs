@@ -392,6 +392,8 @@ impl CaptureTask {
                 log::info!("releasing capture: no active client at this position");
                 self.prevent_capture_recreation = true;
                 capture.release().await?;
+                // Reset prevent_capture_recreation after releasing capture
+                self.prevent_capture_recreation = false;
             }
             // we dont care about events from incoming handles except for releasing the capture
             return Ok(());

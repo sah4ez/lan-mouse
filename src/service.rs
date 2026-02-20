@@ -278,9 +278,26 @@ impl Service {
                 pos,
                 fingerprint,
             } => {
+                // Calculate the exit edge (opposite of entry)
+                let exit_edge = pos.opposite();
+                
+                log::info!(
+                    "Service::EmulationEvent::Entered: === REMOTE CURSOR ENTERED ==="
+                );
+                log::info!(
+                    "Service::EmulationEvent::Entered: remote_addr={} | fingerprint={} | entry_edge={:?} | exit_edge={:?}",
+                    addr, fingerprint, pos, exit_edge
+                );
+                log::info!(
+                    "Service::EmulationEvent::Entered: cursor will appear on {:?} edge of this screen, control returns when crossing {:?} edge",
+                    pos, exit_edge
+                );
+                
                 // check if already registered
                 if !self.incoming_conns.contains(&addr) {
                     self.add_incoming(addr, pos, fingerprint.clone());
+                    // Set the entry edge so cursor can only exit through opposite edge
+                    self.emulation.set_entry_edge(pos);
                     self.notify_frontend(FrontendEvent::DeviceEntered {
                         fingerprint,
                         addr,
@@ -294,6 +311,8 @@ impl Service {
                 if let Some(addr) = self.remove_incoming(addr) {
                     self.notify_frontend(FrontendEvent::IncomingDisconnected(addr));
                 }
+                // Clear the entry edge when a client disconnects
+                self.emulation.clear_entry_edge();
             }
             EmulationEvent::PortChanged(port) => match port {
                 Ok(port) => {
@@ -312,6 +331,16 @@ impl Service {
                 self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
             }
             EmulationEvent::ReleaseNotify => self.capture.release(),
+            EmulationEvent::EdgeCrossed => {
+                log::info!("control returning: cursor crossed exit edge, sending Leave event to incoming clients");
+                // Send Leave event to all incoming connections
+                for addr in self.incoming_conns.iter() {
+                    log::info!("sending Leave event to remote {}", addr);
+                    self.emulation.send_leave_event(*addr);
+                }
+                // Release capture on local machine
+                self.capture.release();
+            }
             EmulationEvent::Connected { addr, fingerprint } => {
                 self.notify_frontend(FrontendEvent::DeviceConnected { addr, fingerprint });
             }

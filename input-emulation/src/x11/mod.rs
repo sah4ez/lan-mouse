@@ -153,8 +153,13 @@ impl X11Emulation {
         // Создаем трансформер координат
         let coord_transformer = CoordinateTransformer::new(screen_config.clone());
 
-        // Создаем менеджер курсора
-        let edge_config = EdgeConfig::default();
+        // Создаем менеджер курсора с увеличенным порогом обнаружения края (10 пикселей)
+        let edge_config = EdgeConfig {
+            edge_threshold: 10,
+            edge_counter_threshold: 1,
+            warp_offset: 1,
+            enable_warping: true,
+        };
         let cursor_manager =
             CursorManager::new(display.clone(), screen_config.clone(), edge_config);
 
@@ -376,5 +381,30 @@ impl Emulation for X11Emulation {
 
     async fn terminate(&mut self) {
         // Нечего делать
+    }
+
+    async fn check_edge_crossing(&mut self) -> Option<()> {
+        if self.cursor_manager.check_edge_crossing().is_some() {
+            Some(())
+        } else {
+            None
+        }
+    }
+
+    async fn set_entry_edge(&mut self, position: lan_mouse_ipc::Position) {
+        use lan_mouse_ipc::Position as IpcPosition;
+        let edge = match position {
+            IpcPosition::Left => cursor::Position::Left,
+            IpcPosition::Right => cursor::Position::Right,
+            IpcPosition::Top => cursor::Position::Top,
+            IpcPosition::Bottom => cursor::Position::Bottom,
+        };
+        if let Err(e) = self.cursor_manager.set_entry_edge(edge) {
+            log::error!("Failed to set entry edge and warp cursor: {}", e);
+        }
+    }
+
+    async fn clear_entry_edge(&mut self) {
+        self.cursor_manager.clear_entry_edge();
     }
 }

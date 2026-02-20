@@ -331,6 +331,11 @@ pub fn emulate_key(
     linux_scancode: u32,
     state: u8,
 ) -> X11Result<()> {
+    // MEDIUM PRIORITY: Validate display before use (prevents use-after-free)
+    if !display.is_valid() {
+        return Err(X11EmulationError::InvalidDisplay);
+    }
+    
     let x11_keycode = mapper.linux_to_x11(linux_scancode);
     let pressed = state == 1;
 

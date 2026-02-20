@@ -42,6 +42,11 @@ impl ScrollConfig {
 
     /// Detect scroll direction from system settings via XInput2
     pub fn detect_from_system(display: &X11DisplayHandle) -> X11Result<Self> {
+        // MEDIUM PRIORITY: Validate display before use (prevents use-after-free)
+        if !display.is_valid() {
+            return Err(X11EmulationError::InvalidDisplay);
+        }
+        
         tracing::debug!(target: "x11::scroll::detect", "detecting scroll direction");
 
         unsafe {
@@ -143,6 +148,11 @@ pub fn emulate_scroll(
     scroll_config: &ScrollConfig,
     event: ScrollEvent,
 ) -> X11Result<()> {
+    // MEDIUM PRIORITY: Validate display before use (prevents use-after-free)
+    if !display.is_valid() {
+        return Err(X11EmulationError::InvalidDisplay);
+    }
+    
     let adjusted_value = scroll_config.adjust_scroll_value(event.value);
 
     // Determine scroll button

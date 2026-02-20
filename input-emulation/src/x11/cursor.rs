@@ -88,17 +88,24 @@ pub struct EdgeDetector {
     config: EdgeConfig,
     /// Screen bounds
     screen_bounds: Rect,
+    /// Timestamp of last position update
+    last_update: std::time::Instant,
+    /// Grace period after position reset (to prevent immediate edge detection after enter)
+    grace_period_end: std::time::Instant,
 }
 
 impl EdgeDetector {
     /// Create a new edge detector
     pub fn new(config: EdgeConfig, screen_bounds: Rect) -> Self {
+        let now = std::time::Instant::now();
         Self {
             current_pos: (0, 0),
             previous_pos: (0, 0),
             edge_counter: 0,
             config,
             screen_bounds,
+            last_update: now,
+            grace_period_end: now,
         }
     }
 
@@ -106,34 +113,42 @@ impl EdgeDetector {
     pub fn update(&mut self, x: i32, y: i32) -> Option<Position> {
         self.previous_pos = self.current_pos;
         self.current_pos = (x, y);
+        self.last_update = std::time::Instant::now();
 
-        tracing::trace!(
-            target: "x11::cursor::edge",
-            x,
-            y,
-            previous_x = self.previous_pos.0,
-            previous_y = self.previous_pos.1,
-            "edge detector update"
+        log::debug!(
+            "x11::cursor::edge: x={}, y={}, previous_x={}, previous_y={}, screen_width={}, screen_height={}, edge_threshold={}",
+            x, y, self.previous_pos.0, self.previous_pos.1,
+            self.screen_bounds.width, self.screen_bounds.height, self.config.edge_threshold
         );
+
+        // Check if we're in grace period (prevent immediate edge detection after reset)
+        let in_grace_period = self.last_update < self.grace_period_end;
+        if in_grace_period {
+            log::debug!("x11::cursor::edge: in grace period, skipping edge detection");
+            return None;
+        }
+
+        // Calculate right and bottom edge thresholds
+        let right_edge_threshold = self.screen_bounds.width as i32 - self.config.edge_threshold;
+        let bottom_edge_threshold = self.screen_bounds.height as i32 - self.config.edge_threshold;
 
         // Check if we're at an edge
         let at_left = x <= self.config.edge_threshold;
-        let at_right = x >= (self.screen_bounds.width as i32 - self.config.edge_threshold);
+        let at_right = x >= right_edge_threshold;
         let at_top = y <= self.config.edge_threshold;
-        let at_bottom = y >= (self.screen_bounds.height as i32 - self.config.edge_threshold);
+        let at_bottom = y >= bottom_edge_threshold;
+
+        log::debug!(
+            "x11::cursor::edge: at_left={}, at_right={}, at_top={}, at_bottom={}, right_edge_threshold={}, bottom_edge_threshold={}",
+            at_left, at_right, at_top, at_bottom, right_edge_threshold, bottom_edge_threshold
+        );
 
         if at_left || at_right || at_top || at_bottom {
             self.edge_counter += 1;
 
-            tracing::trace!(
-                target: "x11::cursor::edge",
-                at_left,
-                at_right,
-                at_top,
-                at_bottom,
-                counter = self.edge_counter,
-                threshold = self.config.edge_counter_threshold,
-                "cursor at edge"
+            log::debug!(
+                "x11::cursor::edge: cursor at edge - at_left={}, at_right={}, at_top={}, at_bottom={}, counter={}, threshold={}",
+                at_left, at_right, at_top, at_bottom, self.edge_counter, self.config.edge_counter_threshold
             );
 
             if self.edge_counter >= self.config.edge_counter_threshold {
@@ -141,40 +156,30 @@ impl EdgeDetector {
 
                 // Determine which edge was crossed
                 if at_left && self.previous_pos.0 > self.config.edge_threshold {
-                    tracing::info!(
-                        target: "x11::cursor::edge",
-                        position = "Left",
-                        "edge crossed"
+                    log::info!(
+                        "x11::cursor::edge: edge crossed - position=Left, current_x={}, previous_x={}, threshold={}",
+                        x, self.previous_pos.0, self.config.edge_threshold
                     );
                     return Some(Position::Left);
                 }
-                if at_right
-                    && self.previous_pos.0
-                        < (self.screen_bounds.width as i32 - self.config.edge_threshold)
-                {
-                    tracing::info!(
-                        target: "x11::cursor::edge",
-                        position = "Right",
-                        "edge crossed"
+                if at_right && self.previous_pos.0 < right_edge_threshold {
+                    log::info!(
+                        "x11::cursor::edge: edge crossed - position=Right, current_x={}, previous_x={}, threshold={}",
+                        x, self.previous_pos.0, right_edge_threshold
                     );
                     return Some(Position::Right);
                 }
                 if at_top && self.previous_pos.1 > self.config.edge_threshold {
-                    tracing::info!(
-                        target: "x11::cursor::edge",
-                        position = "Top",
-                        "edge crossed"
+                    log::info!(
+                        "x11::cursor::edge: edge crossed - position=Top, current_y={}, previous_y={}, threshold={}",
+                        y, self.previous_pos.1, self.config.edge_threshold
                     );
                     return Some(Position::Top);
                 }
-                if at_bottom
-                    && self.previous_pos.1
-                        < (self.screen_bounds.height as i32 - self.config.edge_threshold)
-                {
-                    tracing::info!(
-                        target: "x11::cursor::edge",
-                        position = "Bottom",
-                        "edge crossed"
+                if at_bottom && self.previous_pos.1 < bottom_edge_threshold {
+                    log::info!(
+                        "x11::cursor::edge: edge crossed - position=Bottom, current_y={}, previous_y={}, threshold={}",
+                        y, self.previous_pos.1, bottom_edge_threshold
                     );
                     return Some(Position::Bottom);
                 }
@@ -182,11 +187,7 @@ impl EdgeDetector {
         } else {
             // Not at edge, reset counter
             if self.edge_counter > 0 {
-                tracing::trace!(
-                    target: "x11::cursor::edge",
-                    counter = self.edge_counter,
-                    "resetting edge counter"
-                );
+                log::debug!("x11::cursor::edge: resetting edge counter, counter={}", self.edge_counter);
                 self.edge_counter = 0;
             }
         }
@@ -197,9 +198,11 @@ impl EdgeDetector {
     /// Reset the detector
     pub fn reset(&mut self) {
         self.edge_counter = 0;
-        tracing::trace!(
+        // Set grace period to 500ms to prevent immediate edge detection after reset
+        self.grace_period_end = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        tracing::debug!(
             target: "x11::cursor::edge",
-            "edge detector reset"
+            "edge detector reset, grace period set to 500ms"
         );
     }
 
@@ -234,8 +237,10 @@ pub struct CursorManager {
     edge_detector: EdgeDetector,
     /// Saved enter position
     enter_position: Option<(i32, i32)>,
-    /// Current capture position
+    /// Current capture position (set via set_entry_edge)
     capture_position: Option<Position>,
+    /// Inferred entry edge (detected from first cursor position near edge)
+    inferred_entry_edge: Option<Position>,
 }
 
 impl CursorManager {
@@ -259,12 +264,18 @@ impl CursorManager {
             edge_detector,
             enter_position: None,
             capture_position: None,
+            inferred_entry_edge: None,
         }
     }
 
     /// Query current cursor position
     pub fn query_position(&self) -> X11Result<CursorPosition> {
         tracing::trace!(target: "x11::cursor", "querying cursor position");
+
+        // MEDIUM PRIORITY: Validate display before use (prevents use-after-free)
+        if !self.display.is_valid() {
+            return Err(X11EmulationError::InvalidDisplay);
+        }
 
         let (root_x, root_y) = unsafe {
             let mut root_x: i32 = 0;
@@ -351,6 +362,11 @@ impl CursorManager {
             "warping cursor"
         );
 
+        // MEDIUM PRIORITY: Validate display before use (prevents use-after-free)
+        if !self.display.is_valid() {
+            return Err(X11EmulationError::InvalidDisplay);
+        }
+
         unsafe {
             let root_window = x11::xlib::XDefaultRootWindow(self.display.get());
             x11::xlib::XWarpPointer(
@@ -414,14 +430,61 @@ impl CursorManager {
     /// Check for edge crossing
     pub fn check_edge_crossing(&mut self) -> Option<Position> {
         match self.query_position() {
-            Ok(pos) => self
-                .edge_detector
-                .update(pos.virtual_pos.0, pos.virtual_pos.1),
+            Ok(pos) => {
+                let edge = self.edge_detector.update(pos.virtual_pos.0, pos.virtual_pos.1);
+                
+                // Only trigger edge crossing if it's the opposite edge from entry
+                if let Some(crossed_edge) = edge {
+                    // Calculate expected exit edge based on entry edge
+                    let expected_exit = self.capture_position.map(|entry| match entry {
+                        Position::Left => Position::Right,
+                        Position::Right => Position::Left,
+                        Position::Top => Position::Bottom,
+                        Position::Bottom => Position::Top,
+                    });
+                    
+                    // Use explicitly set entry edge only (no inference)
+                    if let Some(entry_edge) = self.capture_position {
+                        // Only allow exit through opposite edge
+                        let is_opposite = crossed_edge == expected_exit.unwrap();
+                        
+                        if is_opposite {
+                            log::info!(
+                                "x11::cursor::exit: === CURSOR EXIT DETECTED ==="
+                            );
+                            log::info!(
+                                "x11::cursor::exit: crossed_edge={:?} | entry_edge={:?} | expected_exit={:?} | match=YES",
+                                crossed_edge, entry_edge, expected_exit.unwrap()
+                            );
+                            log::info!(
+                                "x11::cursor::exit: cursor_position=({}, {}) | returning control to remote",
+                                pos.virtual_pos.0, pos.virtual_pos.1
+                            );
+                            Some(crossed_edge)
+                        } else {
+                            log::debug!(
+                                "x11::cursor::exit: crossed_edge={:?} | entry_edge={:?} | expected_exit={:?} | match=NO (ignoring)",
+                                crossed_edge, entry_edge, expected_exit.unwrap()
+                            );
+                            None
+                        }
+                    } else {
+                        // No entry edge set - ignore edge crossing
+                        // Entry edge should be set via set_entry_edge when remote sends Enter event
+                        log::info!(
+                            "x11::cursor::exit: crossed_edge={:?} | cursor_position=({}, {}) | status=NO_ENTRY_EDGE_SET (ignoring - waiting for ProtoEvent::Enter)",
+                            crossed_edge, pos.virtual_pos.0, pos.virtual_pos.1
+                        );
+                        None
+                    }
+                } else {
+                    None
+                }
+            },
             Err(e) => {
-                tracing::warn!(
-                    target: "x11::cursor::edge",
-                    error = %e,
-                    "failed to query cursor position for edge detection"
+                log::warn!(
+                    "x11::cursor::edge: failed to query cursor position for edge detection: {}",
+                    e
                 );
                 None
             }
@@ -520,6 +583,151 @@ impl CursorManager {
     /// Get mutable edge detector reference
     pub fn edge_detector_mut(&mut self) -> &mut EdgeDetector {
         &mut self.edge_detector
+    }
+
+    /// Infer entry edge from cursor position
+    /// Uses the first position to determine which edge the cursor entered from.
+    /// If cursor is in the left third of the screen, entry was from Left.
+    /// If cursor is in the right third of the screen, entry was from Right.
+    /// This is a heuristic for when the explicit entry edge is not set.
+    fn infer_entry_edge_from_position(&self, x: i32, y: i32) -> Option<Position> {
+        let width = self.screen_config.virtual_bounds.width as i32;
+        let height = self.screen_config.virtual_bounds.height as i32;
+        
+        // Use thirds of the screen to determine entry edge
+        let left_third = width / 3;
+        let right_third = width * 2 / 3;
+        let top_third = height / 3;
+        let bottom_third = height * 2 / 3;
+        
+        // If cursor is in the left third of the screen, entry was from Left
+        if x <= left_third {
+            log::info!(
+                "x11::cursor::edge: inferring entry edge=Left from position x={} (left_third={})",
+                x, left_third
+            );
+            return Some(Position::Left);
+        }
+        // If cursor is in the right third of the screen, entry was from Right
+        if x >= right_third {
+            log::info!(
+                "x11::cursor::edge: inferring entry edge=Right from position x={} (right_third={})",
+                x, right_third
+            );
+            return Some(Position::Right);
+        }
+        // If cursor is in the top third of the screen, entry was from Top
+        if y <= top_third {
+            log::info!(
+                "x11::cursor::edge: inferring entry edge=Top from position y={} (top_third={})",
+                y, top_third
+            );
+            return Some(Position::Top);
+        }
+        // If cursor is in the bottom third of the screen, entry was from Bottom
+        if y >= bottom_third {
+            log::info!(
+                "x11::cursor::edge: inferring entry edge=Bottom from position y={} (bottom_third={})",
+                y, bottom_third
+            );
+            return Some(Position::Bottom);
+        }
+        
+        // Cursor is in the center of the screen, cannot reliably infer entry
+        log::debug!(
+            "x11::cursor::edge: cannot infer entry edge from position ({}, {}) - cursor in center",
+            x, y
+        );
+        None
+    }
+
+    /// Set the entry edge when a client enters
+    /// This determines which edge the cursor must cross to return control
+    /// The cursor is warped to the entry edge position
+    pub fn set_entry_edge(&mut self, position: Position) -> X11Result<()> {
+        // Calculate the opposite edge where cursor must exit
+        let exit_edge = match position {
+            Position::Left => Position::Right,
+            Position::Right => Position::Left,
+            Position::Top => Position::Bottom,
+            Position::Bottom => Position::Top,
+        };
+        
+        log::info!(
+            "x11::cursor::entry: === ENTRY EDGE SET (EXPLICIT via ProtoEvent::Enter) ==="
+        );
+        log::info!(
+            "x11::cursor::entry: entry_edge={:?} | exit_edge={:?} | source=EXPLICIT",
+            position,
+            exit_edge
+        );
+        
+        // Warp cursor to the entry edge
+        // If remote crossed LEFT edge, cursor appears on RIGHT side of this screen (and vice versa)
+        let (x, y) = match position {
+            Position::Left => {
+                // Remote crossed left edge, cursor appears on right side
+                (
+                    self.screen_config.primary.width as i32 - self.edge_detector.config.warp_offset,
+                    self.screen_config.primary.height as i32 / 2,
+                )
+            }
+            Position::Right => {
+                // Remote crossed right edge, cursor appears on left side
+                (
+                    self.edge_detector.config.warp_offset,
+                    self.screen_config.primary.height as i32 / 2,
+                )
+            }
+            Position::Top => {
+                // Remote crossed top edge, cursor appears on bottom side
+                (
+                    self.screen_config.primary.width as i32 / 2,
+                    self.screen_config.primary.height as i32 - self.edge_detector.config.warp_offset,
+                )
+            }
+            Position::Bottom => {
+                // Remote crossed bottom edge, cursor appears on top side
+                (
+                    self.screen_config.primary.width as i32 / 2,
+                    self.edge_detector.config.warp_offset,
+                )
+            }
+        };
+        
+        log::info!(
+            "x11::cursor::entry: warping cursor to ({}, {}) on {:?} edge of screen ({})",
+            x, y, position,
+            if matches!(position, Position::Left | Position::Right) { "horizontal center" } else { "vertical center" }
+        );
+        
+        self.warp_cursor(x, y)?;
+        
+        self.capture_position = Some(position);
+        // Clear any inferred edge since we now have explicit edge
+        self.inferred_entry_edge = None;
+        // Reset the edge detector to prevent immediate edge detection
+        self.edge_detector.reset();
+        
+        log::info!(
+            "x11::cursor::entry: entry edge setup complete - cursor will return control when crossing {:?} edge",
+            exit_edge
+        );
+        
+        Ok(())
+    }
+
+    /// Clear the entry edge when a client leaves
+    pub fn clear_entry_edge(&mut self) {
+        log::info!(
+            "x11::cursor::entry: === ENTRY EDGE CLEARED ==="
+        );
+        log::info!(
+            "x11::cursor::entry: previous_entry_edge={:?} | cursor can now exit through ANY edge",
+            self.capture_position
+        );
+        self.capture_position = None;
+        self.inferred_entry_edge = None;
     }
 }
 

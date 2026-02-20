@@ -188,6 +188,11 @@ pub fn emulate_button(
     button: u32,
     state: u8,
 ) -> X11Result<()> {
+    // MEDIUM PRIORITY: Validate display before use (prevents use-after-free)
+    if !display.is_valid() {
+        return Err(X11EmulationError::InvalidDisplay);
+    }
+    
     let x11_button = button_mapper.to_x11_button(button);
     let pressed = state == 1;
 

@@ -174,6 +174,19 @@ impl Emulation for WlrootsEmulation {
     async fn terminate(&mut self) {
         /* nothing to do */
     }
+
+    async fn check_edge_crossing(&mut self) -> Option<()> {
+        // wlroots emulation doesn't support edge detection yet
+        None
+    }
+
+    async fn set_entry_edge(&mut self, _position: lan_mouse_ipc::Position) {
+        /* nothing to do */
+    }
+
+    async fn clear_entry_edge(&mut self) {
+        /* nothing to do */
+    }
 }
 
 struct VirtualInput {

@@ -443,6 +443,19 @@ impl Emulation for MacOSEmulation {
     async fn destroy(&mut self, _handle: EmulationHandle) {}
 
     async fn terminate(&mut self) {}
+
+    async fn check_edge_crossing(&mut self) -> Option<()> {
+        // macOS emulation doesn't support edge detection yet
+        None
+    }
+
+    async fn set_entry_edge(&mut self, _position: lan_mouse_ipc::Position) {
+        /* nothing to do */
+    }
+
+    async fn clear_entry_edge(&mut self) {
+        /* nothing to do */
+    }
 }
 
 trait ButtonEq {

@@ -433,28 +433,20 @@ impl CursorManager {
             Ok(pos) => {
                 let edge = self.edge_detector.update(pos.virtual_pos.0, pos.virtual_pos.1);
                 
-                // Only trigger edge crossing if it's the opposite edge from entry
+                // Only trigger edge crossing if it's the same edge where cursor entered
                 if let Some(crossed_edge) = edge {
-                    // Calculate expected exit edge based on entry edge
-                    let expected_exit = self.capture_position.map(|entry| match entry {
-                        Position::Left => Position::Right,
-                        Position::Right => Position::Left,
-                        Position::Top => Position::Bottom,
-                        Position::Bottom => Position::Top,
-                    });
-                    
                     // Use explicitly set entry edge only (no inference)
                     if let Some(entry_edge) = self.capture_position {
-                        // Only allow exit through opposite edge
-                        let is_opposite = crossed_edge == expected_exit.unwrap();
+                        // Only allow exit through the same edge where cursor entered
+                        let matches_entry_edge = crossed_edge == entry_edge;
                         
-                        if is_opposite {
+                        if matches_entry_edge {
                             log::info!(
                                 "x11::cursor::exit: === CURSOR EXIT DETECTED ==="
                             );
                             log::info!(
-                                "x11::cursor::exit: crossed_edge={:?} | entry_edge={:?} | expected_exit={:?} | match=YES",
-                                crossed_edge, entry_edge, expected_exit.unwrap()
+                                "x11::cursor::exit: crossed_edge={:?} | entry_edge={:?} | match=YES",
+                                crossed_edge, entry_edge
                             );
                             log::info!(
                                 "x11::cursor::exit: cursor_position=({}, {}) | returning control to remote",
@@ -463,8 +455,8 @@ impl CursorManager {
                             Some(crossed_edge)
                         } else {
                             log::debug!(
-                                "x11::cursor::exit: crossed_edge={:?} | entry_edge={:?} | expected_exit={:?} | match=NO (ignoring)",
-                                crossed_edge, entry_edge, expected_exit.unwrap()
+                                "x11::cursor::exit: crossed_edge={:?} | entry_edge={:?} | match=NO (ignoring)",
+                                crossed_edge, entry_edge
                             );
                             None
                         }
@@ -646,12 +638,7 @@ impl CursorManager {
     /// The cursor is warped to the entry edge position
     pub fn set_entry_edge(&mut self, position: Position) -> X11Result<()> {
         // Calculate the opposite edge where cursor must exit
-        let exit_edge = match position {
-            Position::Left => Position::Right,
-            Position::Right => Position::Left,
-            Position::Top => Position::Bottom,
-            Position::Bottom => Position::Top,
-        };
+        let exit_edge = position;
         
         log::info!(
             "x11::cursor::entry: === ENTRY EDGE SET (EXPLICIT via ProtoEvent::Enter) ==="

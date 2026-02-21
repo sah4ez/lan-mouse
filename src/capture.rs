@@ -83,6 +83,8 @@ impl Capture {
             release_bind: Rc::new(RefCell::new(release_bind)),
             state: Default::default(),
             prevent_capture_recreation: false,
+            wait_for_ack_since: None,
+            ack_timeout: Duration::from_secs(5),
         };
         let task = spawn_local(capture_task.run());
         Self {
@@ -166,6 +168,10 @@ struct CaptureTask {
     state: State,
     /// Flag to prevent capture recreation when a client has just entered the device
     prevent_capture_recreation: bool,
+    /// Timestamp when we entered WaitingForAck state (for timeout detection)
+    wait_for_ack_since: Option<Instant>,
+    /// Timeout for WaitingForAck state before resetting
+    ack_timeout: Duration,
 }
 
 impl CaptureTask {
@@ -275,6 +281,8 @@ impl CaptureTask {
         // This ensures edge detection works even when there are no XRecord events
         // (e.g., when cursor is being emulated by remote client)
         let mut edge_check_interval = tokio::time::interval(tokio::time::Duration::from_millis(10));
+        // Timer for checking ACK timeout
+        let mut ack_timeout_check_interval = tokio::time::interval(tokio::time::Duration::from_millis(500));
 
         loop {
             tokio::select! {
@@ -303,13 +311,15 @@ impl CaptureTask {
                         ProtoEvent::Ack(_) => {
                             log::info!("client {handle} acknowledged the connection!");
                             self.state = State::Sending;
+                            self.wait_for_ack_since = None;
                         }
                         // client disconnected
                         ProtoEvent::Leave(_) => {
-                            log::info!("releasing capture: left remote client device region");
+                            log::info!("releasing capture: left remote client device region or connection lost");
                             self.release_capture(capture).await?;
                             // Reset state to WaitingForAck when client disconnects
                             self.state = State::WaitingForAck;
+                            self.wait_for_ack_since = None;
                         },
                         _ => {}
                     }
@@ -339,6 +349,17 @@ impl CaptureTask {
                         if let Ok((pos, event)) = event {
                             log::trace!("periodic edge check: handle={}, event={:?}", pos, event);
                             self.handle_capture_event(capture, (pos, event)).await?;
+                        }
+                    }
+                },
+                _ = ack_timeout_check_interval.tick() => {
+                    // Check for ACK timeout - if we've been waiting too long, reset state
+                    if let Some(since) = self.wait_for_ack_since {
+                        if since.elapsed() > self.ack_timeout {
+                            log::warn!("ACK timeout after {:?}, resetting capture state", since.elapsed());
+                            self.release_capture(capture).await?;
+                            self.state = State::WaitingForAck;
+                            self.wait_for_ack_since = None;
                         }
                     }
                 },
@@ -404,6 +425,7 @@ impl CaptureTask {
             if Some(handle) != self.active_client {
                 log::info!("activating new client: handle={handle}, state transition: {:?} -> WaitingForAck", self.state);
                 self.state = State::WaitingForAck;
+                self.wait_for_ack_since = Some(Instant::now());
                 self.active_client.replace(handle);
                 self.event_tx
                     .send(ICaptureEvent::ClientEntered(handle))
@@ -476,6 +498,7 @@ impl CaptureTask {
         }
         // Reset state to WaitingForAck when capture is released
         self.state = State::WaitingForAck;
+        self.wait_for_ack_since = None;
         log::info!("calling capture.release(), state reset to WaitingForAck");
         capture.release().await
     }

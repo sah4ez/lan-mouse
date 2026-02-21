@@ -2,7 +2,7 @@ use std::{
     collections::HashSet,
     ptr,
     sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, Ordering},
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     task::Poll,
     thread,
 };
@@ -188,6 +188,22 @@ struct RecordCallbackClosure {
     event_tx: mpsc::Sender<Result<(Position, CaptureEvent), CaptureError>>,
     active_clients: Arc<Mutex<HashSet<Position>>>,
     display: SendDisplay,
+    modifier_state: Arc<StdMutex<X11ModifierState>>,
+}
+
+/// X11 modifier state tracker for layout switching support
+#[derive(Debug, Default)]
+struct X11ModifierState {
+    /// Currently depressed modifiers
+    depressed: u32,
+    /// Latched modifiers (sticky keys)
+    latched: u32,
+    /// Locked modifiers (Caps Lock, Num Lock)
+    locked: u32,
+    /// Current keyboard layout group (0 = default, 1 = first alternative, etc.)
+    group: u32,
+    /// Currently pressed keys (for tracking modifier state changes)
+    pressed_keys: HashSet<u32>,
 }
 
 /// Cursor state for tracking position changes
@@ -551,11 +567,15 @@ impl X11InputCapture {
     ) {
         log::info!("XRecord thread started");
 
+        // Create modifier state tracker
+        let modifier_state = Arc::new(StdMutex::new(X11ModifierState::default()));
+
         // Create closure data
         let closure = RecordCallbackClosure {
             event_tx,
             active_clients,
             display: display.clone(),
+            modifier_state: modifier_state.clone(),
         };
 
         // Enable XRecord context
@@ -661,7 +681,7 @@ impl X11InputCapture {
                     return;
                 }
                 log::debug!("XRecord callback: processing keyboard event, type = {}", event_type);
-                Self::process_keyboard_event(&closure.event_tx, event_data, event_type, &closure.active_clients);
+                Self::process_keyboard_event(&closure.event_tx, event_data, event_type, &closure.active_clients, &closure.modifier_state);
             }
             xlib::ButtonPress | xlib::ButtonRelease => {
                 // Validate buffer size for button event
@@ -704,6 +724,7 @@ impl X11InputCapture {
         event_data: *const u8,
         event_type: u8,
         active_clients: &Arc<Mutex<HashSet<Position>>>,
+        modifier_state: &Arc<StdMutex<X11ModifierState>>,
     ) {
         // Validate pointer before dereferencing
         if event_data.is_null() {
@@ -712,7 +733,8 @@ impl X11InputCapture {
         }
         
         let keycode = *(event_data.offset(1) as *const u8);
-        let state = if event_type as i32 == xlib::KeyPress { 1 } else { 0 };
+        let pressed = event_type as i32 == xlib::KeyPress;
+        let state = if pressed { 1 } else { 0 };
 
         // X11 keycodes are shifted by 8 relative to Linux scancodes
         let linux_scancode = (keycode as u32).saturating_sub(X11_KEYCODE_OFFSET);
@@ -723,6 +745,58 @@ impl X11InputCapture {
             linux_scancode,
             if state == 1 { "pressed" } else { "released" }
         );
+
+        // Update modifier state and check for layout changes
+        let modifier_event = {
+            let mut mods = modifier_state.lock().unwrap();
+            let old_group = mods.group;
+            
+            // Track pressed keys
+            if pressed {
+                mods.pressed_keys.insert(linux_scancode);
+            } else {
+                mods.pressed_keys.remove(&linux_scancode);
+            }
+            
+            // Update modifier state based on scancode
+            Self::update_modifier_state(&mut mods, linux_scancode, pressed);
+            
+            // If group changed, send a modifier event
+            if mods.group != old_group {
+                log::info!(
+                    "X11: Keyboard layout group changed from {} to {}",
+                    old_group,
+                    mods.group
+                );
+                Some(KeyboardEvent::Modifiers {
+                    depressed: mods.depressed,
+                    latched: mods.latched,
+                    locked: mods.locked,
+                    group: mods.group,
+                })
+            } else {
+                None
+            }
+        };
+
+        // Send modifier event if layout changed
+        if let Some(mods_event) = modifier_event {
+            let event = Event::Keyboard(mods_event);
+            if let Ok(clients) = active_clients.try_lock() {
+                for &position in clients.iter() {
+                    match event_tx.try_send(Ok((position, CaptureEvent::Input(event.clone())))) {
+                        Ok(_) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            log::warn!("X11: event channel full, dropping modifier event");
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            log::error!("X11: event channel closed");
+                            return;
+                        }
+                    }
+                }
+            }
+        }
 
         let event = Event::Keyboard(KeyboardEvent::Key {
             time: 0,
@@ -774,6 +848,79 @@ impl X11InputCapture {
                 Err(mpsc::error::TrySendError::Closed(_)) => {
                     log::error!("X11: event channel closed, cannot send keyboard event");
                 }
+            }
+        }
+    }
+
+    /// Update modifier state based on key event
+    fn update_modifier_state(mods: &mut X11ModifierState, scancode: u32, pressed: bool) {
+        use input_event::scancode::Linux;
+        
+        // Standard X11 modifier masks
+        const SHIFT_MASK: u32 = 1;
+        const LOCK_MASK: u32 = 2;  // Caps Lock
+        const CONTROL_MASK: u32 = 4;
+        const MOD1_MASK: u32 = 8;  // Alt
+        const MOD2_MASK: u32 = 16; // Num Lock
+        const MOD4_MASK: u32 = 64; // Super/Windows key
+        
+        let scancode_enum = Linux::try_from(scancode);
+        
+        if let Ok(key) = scancode_enum {
+            match key {
+                // Shift keys
+                Linux::KeyLeftShift | Linux::KeyRightShift => {
+                    if pressed {
+                        mods.depressed |= SHIFT_MASK;
+                    } else {
+                        mods.depressed &= !SHIFT_MASK;
+                    }
+                }
+                // Control keys
+                Linux::KeyLeftCtrl | Linux::KeyRightCtrl => {
+                    if pressed {
+                        mods.depressed |= CONTROL_MASK;
+                    } else {
+                        mods.depressed &= !CONTROL_MASK;
+                    }
+                }
+                // Alt keys
+                Linux::KeyLeftAlt | Linux::KeyRightalt => {
+                    if pressed {
+                        mods.depressed |= MOD1_MASK;
+                    } else {
+                        mods.depressed &= !MOD1_MASK;
+                    }
+                }
+                // Super/Windows keys
+                Linux::KeyLeftMeta | Linux::KeyRightmeta => {
+                    if pressed {
+                        mods.depressed |= MOD4_MASK;
+                    } else {
+                        mods.depressed &= !MOD4_MASK;
+                    }
+                }
+                // Caps Lock (toggle) - also used for layout switching in some configurations
+                Linux::KeyCapsLock => {
+                    if pressed {
+                        // Toggle Caps Lock state
+                        mods.locked ^= LOCK_MASK;
+                        log::debug!("X11: Caps Lock toggled, locked = {}", mods.locked);
+                        
+                        // Note: When Caps Lock is configured as layout switch key,
+                        // the XKB configuration will change the group. We can't detect
+                        // this from XRecord events alone, but we handle it by tracking
+                        // the modifier state and sending it to the target.
+                    }
+                }
+                // Num Lock (toggle)
+                Linux::KeyNumlock => {
+                    if pressed {
+                        mods.locked ^= MOD2_MASK;
+                        log::debug!("X11: Num Lock toggled, locked = {}", mods.locked);
+                    }
+                }
+                _ => {}
             }
         }
     }

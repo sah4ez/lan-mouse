@@ -191,7 +191,7 @@ impl LanMouseConnection {
                     Ok(_) => {}
                     Err(e) => {
                         log::warn!("client {handle} failed to send: {e}");
-                        disconnect(&self.client_manager, handle, addr, &self.conns).await;
+                        disconnect(&self.client_manager, handle, addr, &self.conns, &self.recv_tx).await;
                     }
                 }
                 log::trace!("{event} >->->->->- {addr}");
@@ -324,7 +324,7 @@ async fn receive_loop(
         }
     }
     log::warn!("recv error");
-    disconnect(&client_manager, handle, addr, &conns).await;
+    disconnect(&client_manager, handle, addr, &conns, &tx).await;
 }
 
 async fn disconnect(
@@ -332,10 +332,19 @@ async fn disconnect(
     handle: ClientHandle,
     addr: SocketAddr,
     conns: &Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>,
+    tx: &Sender<(ClientHandle, ProtoEvent)>,
 ) {
     log::warn!("client ({handle}) @ {addr} connection closed");
     conns.lock().await.remove(&addr);
     client_manager.set_active_addr(handle, None);
+    
+    // Notify capture task about disconnection by sending Leave event
+    // This ensures the capture state is reset properly
+    log::info!("sending Leave event to capture task for handle {handle} due to disconnect");
+    if let Err(e) = tx.send((handle, ProtoEvent::Leave(0))) {
+        log::warn!("failed to send disconnect notification to capture task: {e}");
+    }
+    
     let active: Vec<SocketAddr> = conns.lock().await.keys().copied().collect();
     log::info!("active connections: {active:?}");
 }

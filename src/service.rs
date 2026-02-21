@@ -342,6 +342,42 @@ impl Service {
                 self.capture.release();
             }
             EmulationEvent::Connected { addr, fingerprint } => {
+                log::info!(
+                    "Service::EmulationEvent::Connected: remote {} connected (fingerprint={})",
+                    addr, fingerprint
+                );
+                
+                // Try to find the configured position for this client based on fingerprint
+                let configured_pos = self.find_client_position_by_fingerprint(&fingerprint);
+                
+                if let Some(pos) = configured_pos {
+                    log::info!(
+                        "Service::EmulationEvent::Connected: found configured position for fingerprint {}: {:?}",
+                        fingerprint, pos
+                    );
+                    log::info!(
+                        "Service::EmulationEvent::Connected: setting entry_edge={:?} based on config (remote did not send ProtoEvent::Enter)",
+                        pos
+                    );
+                    
+                    // Add incoming connection with configured position
+                    if !self.incoming_conns.contains(&addr) {
+                        self.add_incoming(addr, pos, fingerprint.clone());
+                        // Set the entry edge so cursor can only exit through opposite edge
+                        self.emulation.set_entry_edge(pos);
+                        self.notify_frontend(FrontendEvent::DeviceEntered {
+                            fingerprint: fingerprint.clone(),
+                            addr,
+                            pos,
+                        });
+                    }
+                } else {
+                    log::warn!(
+                        "Service::EmulationEvent::Connected: no configured position found for fingerprint {}, edge detection will not work until ProtoEvent::Enter is received",
+                        fingerprint
+                    );
+                }
+                
                 self.notify_frontend(FrontendEvent::DeviceConnected { addr, fingerprint });
             }
         }
@@ -599,6 +635,30 @@ impl Service {
     fn update_enter_hook(&mut self, handle: ClientHandle, enter_hook: Option<String>) {
         self.client_manager.set_enter_hook(handle, enter_hook);
         self.broadcast_client(handle);
+    }
+
+    /// Find client position by fingerprint from authorized keys config
+    fn find_client_position_by_fingerprint(&self, fingerprint: &str) -> Option<Position> {
+        // Look up the client name from authorized fingerprints
+        let authorized_keys = self.authorized_keys.read().expect("lock");
+        let client_name = authorized_keys.get(fingerprint)?;
+        
+        // Find the client in the configured clients list by hostname
+        for client in self.config.clients() {
+            if client.hostname.as_deref() == Some(client_name.as_str()) {
+                log::info!(
+                    "Service::find_client_position: found client '{}' with position {:?} for fingerprint {}",
+                    client_name, client.pos, fingerprint
+                );
+                return Some(client.pos);
+            }
+        }
+        
+        log::debug!(
+            "Service::find_client_position: no configured client found for name '{}' (fingerprint {})",
+            client_name, fingerprint
+        );
+        None
     }
 
     fn broadcast_client(&mut self, handle: ClientHandle) {

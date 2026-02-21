@@ -223,6 +223,8 @@ pub struct KeyboardState {
     pub last_pressed_key: Option<u32>,
     /// Порог времени для детекции авто-повтора
     pub auto_repeat_threshold: Duration,
+    /// Current keyboard layout group (0 = default, 1 = first alternative, etc.)
+    pub current_group: u32,
 }
 
 impl KeyboardState {
@@ -234,6 +236,7 @@ impl KeyboardState {
             last_press_time: None,
             last_pressed_key: None,
             auto_repeat_threshold: Duration::from_millis(50),
+            current_group: 0,
         }
     }
 
@@ -315,6 +318,47 @@ impl KeyboardState {
         self.pressed_keys.clear();
         self.last_press_time = None;
         self.last_pressed_key = None;
+    }
+
+    /// Set the full modifier state (for layout synchronization)
+    pub fn set_modifier_state(&mut self, depressed: u32, latched: u32, locked: u32, group: u32) {
+        tracing::debug!(
+            target: "x11::keyboard::modifiers",
+            depressed = depressed,
+            latched = latched,
+            locked = locked,
+            group = group,
+            "setting full modifier state"
+        );
+        
+        // Update modifier state from the wire format
+        // depressed: currently pressed modifiers
+        // latched: modifiers that will be released after next key press (like sticky keys)
+        // locked: toggle modifiers (Caps Lock, Num Lock)
+        // group: keyboard layout group (0 = default, 1 = first alternative, etc.)
+        
+        // Parse standard X11 modifier masks
+        self.modifiers.shift = (depressed & xlib::ShiftMask) != 0;
+        self.modifiers.ctrl = (depressed & xlib::ControlMask) != 0;
+        self.modifiers.alt = (depressed & xlib::Mod1Mask) != 0;
+        self.modifiers.super_key = (depressed & xlib::Mod4Mask) != 0;
+        self.modifiers.caps_lock = (locked & xlib::LockMask) != 0;
+        self.modifiers.num_lock = (locked & xlib::Mod2Mask) != 0;
+        
+        // Store the current layout group
+        self.current_group = group;
+        
+        tracing::debug!(
+            target: "x11::keyboard::modifiers",
+            shift = self.modifiers.shift,
+            ctrl = self.modifiers.ctrl,
+            alt = self.modifiers.alt,
+            super_key = self.modifiers.super_key,
+            caps_lock = self.modifiers.caps_lock,
+            num_lock = self.modifiers.num_lock,
+            group = group,
+            "modifier state updated"
+        );
     }
 }
 

@@ -285,7 +285,7 @@ impl X11Emulation {
     }
 
     /// Set keyboard layout group for layout switching support
-    /// 
+    ///
     /// This method uses Xkb to switch the active keyboard group,
     /// which is necessary for Cyrillic layout and Caps Lock layout switching.
     fn set_keyboard_group(&self, group: u32) -> Result<(), X11EmulationError> {
@@ -293,18 +293,14 @@ impl X11Emulation {
             return Err(X11EmulationError::InvalidDisplay);
         }
 
-        // Xkb group switching using XTest fake key events
+        // Xkb group switching using XkbLockGroup
         // Group values: 0 = default layout, 1 = first alternative, 2 = second alternative, etc.
         tracing::debug!(
             target: "x11::keyboard::layout",
             group = group,
-            "setting keyboard layout group via XTest"
+            "setting keyboard layout group via Xkb"
         );
 
-        // We use XTestFakeKeyEvent to simulate the layout switch key combination
-        // Most systems use ISO_Next_Group (keycode 108 or similar) to switch layouts
-        // This is a best-effort approach - the actual key may vary by configuration
-        
         unsafe {
             // Get the current group and determine if we need to switch
             let current_group = self.keyboard_state.current_group;
@@ -318,20 +314,34 @@ impl X11Emulation {
                 return Ok(());
             }
 
-            // Try to find the ISO_Next_Group keycode
-            // Common keycodes: 108 (AltGr), 37 (Ctrl), 50 (Shift)
-            // We'll simulate pressing the layout switch key
-            // The keycode for ISO_Next_Group varies, but common values are:
-            // - 108 (ISO_Level3_Shift / AltGr)
-            // - 203 (ISO_Next_Group)
-            
-            // For now, we'll just log the group change request
-            // Actual layout switching is complex and depends on XKB configuration
+            // Use XkbLockGroup to switch the keyboard group
+            // This is the proper way to switch layouts in X11
+            let success = x11::xlib::XkbLockGroup(
+                self.display.get(),
+                x11::xlib::XkbUseCoreKbd,
+                group
+            );
+
+            if success == 0 {
+                tracing::error!(
+                    target: "x11::keyboard::layout",
+                    group = group,
+                    "failed to set keyboard group via XkbLockGroup"
+                );
+                return Err(X11EmulationError::EmulationFailed {
+                    operation: "XkbLockGroup".to_string(),
+                    detail: format!("failed to set keyboard group {}", group),
+                });
+            }
+
+            // Flush to ensure the change is sent to the X server
+            x11::xlib::XFlush(self.display.get());
+
             tracing::info!(
                 target: "x11::keyboard::layout",
                 from_group = current_group,
                 to_group = group,
-                "keyboard layout group change requested (tracking only)"
+                "keyboard layout group switched successfully"
             );
         }
 

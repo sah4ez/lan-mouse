@@ -192,7 +192,7 @@ struct RecordCallbackClosure {
 }
 
 /// X11 modifier state tracker for layout switching support
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct X11ModifierState {
     /// Currently depressed modifiers
     depressed: u32,
@@ -204,6 +204,55 @@ struct X11ModifierState {
     group: u32,
     /// Currently pressed keys (for tracking modifier state changes)
     pressed_keys: HashSet<u32>,
+}
+
+impl Default for X11ModifierState {
+    fn default() -> Self {
+        Self {
+            depressed: 0,
+            latched: 0,
+            locked: 0,
+            group: 0,
+            pressed_keys: HashSet::new(),
+        }
+    }
+}
+
+impl X11ModifierState {
+    /// Create modifier state synchronized with X server
+    ///
+    /// This method queries the current modifier state from X11 using XkbGetState,
+    /// ensuring that the initial state matches the actual X server state.
+    /// This is important for correctly tracking Caps Lock, Num Lock, and layout group.
+    fn from_x11(display: &SendDisplay) -> Self {
+        let mut state = Self::default();
+
+        unsafe {
+            // Get current modifier state using XkbGetState
+            let mut xkb_state: x11::xlib::XkbStateRec = std::mem::zeroed();
+            let success = x11::xlib::XkbGetState(
+                display.get(),
+                x11::xlib::XkbUseCoreKbd,
+                &mut xkb_state
+            );
+
+            if success != 0 {
+                state.depressed = xkb_state.mods as u32;
+                state.latched = xkb_state.base_mods as u32;
+                state.locked = xkb_state.locked_mods as u32;
+                state.group = xkb_state.group as u32;
+
+                log::info!(
+                    "X11: Initial modifier state - depressed={}, latched={}, locked={}, group={}",
+                    state.depressed, state.latched, state.locked, state.group
+                );
+            } else {
+                log::warn!("X11: Failed to get initial modifier state from Xkb, using defaults");
+            }
+        }
+
+        state
+    }
 }
 
 /// Cursor state for tracking position changes
@@ -567,8 +616,8 @@ impl X11InputCapture {
     ) {
         log::info!("XRecord thread started");
 
-        // Create modifier state tracker
-        let modifier_state = Arc::new(StdMutex::new(X11ModifierState::default()));
+        // Create modifier state tracker, synchronized with X server
+        let modifier_state = Arc::new(StdMutex::new(X11ModifierState::from_x11(&display)));
 
         // Create closure data
         let closure = RecordCallbackClosure {

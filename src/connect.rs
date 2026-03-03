@@ -97,16 +97,51 @@ async fn connect(
             }
             Err(e) => {
                 log::error!("DTLS handshake failed with {addr}: {e}");
-                log::error!("This may be due to:");
-                log::error!("  - Network connectivity issues (firewall, NAT)");
-                log::error!("  - DTLS version or cipher suite mismatch");
-                log::error!("  - Certificate validation issues");
-                log::error!("  - The remote device may not be running or may have a different version");
-                log::error!("Try:");
-                log::error!("  - Check if the remote device is running lan-mouse");
-                log::error!("  - Verify network connectivity (ping {addr})");
-                log::error!("  - Check firewall settings");
-                log::error!("  - Ensure both devices are running compatible versions");
+                
+                // Check if this is a "Broken pipe" error (certificate authorization issue)
+                let error_str = format!("{e}");
+                if error_str.contains("Broken pipe") || error_str.contains("os error 32") {
+                    log::error!("==============================================");
+                    log::error!("BROKEN PIPE ERROR - Certificate Authorization Issue");
+                    log::error!("==============================================");
+                    log::error!("");
+                    log::error!("The remote daemon ({addr}) is rejecting your connection");
+                    log::error!("because your certificate fingerprint is NOT in its");
+                    log::error!("authorized_fingerprints list.");
+                    log::error!("");
+                    log::error!("SOLUTION: Exchange certificate fingerprints between machines");
+                    log::error!("");
+                    log::error!("Step 1: Extract YOUR certificate fingerprint:");
+                    log::error!("  ./scripts/extract-fingerprint.sh");
+                    log::error!("");
+                    log::error!("Step 2: Add YOUR fingerprint to REMOTE machine's config:");
+                    log::error!("  On {addr}: Edit ~/.config/lan-mouse/config.toml");
+                    log::error!("  Add to [authorized_fingerprints] section");
+                    log::error!("");
+                    log::error!("Step 3: Extract REMOTE certificate fingerprint:");
+                    log::error!("  ssh {addr} './scripts/extract-fingerprint.sh'");
+                    log::error!("");
+                    log::error!("Step 4: Add REMOTE fingerprint to YOUR machine's config:");
+                    log::error!("  Edit ~/.config/lan-mouse/config.toml");
+                    log::error!("  Add to [authorized_fingerprints] section");
+                    log::error!("");
+                    log::error!("Step 5: Restart BOTH daemons:");
+                    log::error!("  pkill -f 'lan-mouse.*daemon' && lan-mouse daemon");
+                    log::error!("");
+                    log::error!("For detailed instructions, see: BROKEN_PIPE_TROUBLESHOOTING.md");
+                    log::error!("==============================================");
+                } else {
+                    log::error!("This may be due to:");
+                    log::error!("  - Network connectivity issues (firewall, NAT)");
+                    log::error!("  - DTLS version or cipher suite mismatch");
+                    log::error!("  - Certificate validation issues");
+                    log::error!("  - The remote device may not be running or may have a different version");
+                    log::error!("Try:");
+                    log::error!("  - Check if the remote device is running lan-mouse");
+                    log::error!("  - Verify network connectivity (ping {addr})");
+                    log::error!("  - Check firewall settings");
+                    log::error!("  - Ensure both devices are running compatible versions");
+                }
                 Err((addr, e.into()))
             }
         }

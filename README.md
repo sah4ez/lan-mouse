@@ -392,13 +392,39 @@ Where `left` can be either `left`, `right`, `top` or `bottom`.
 
 ### Troubleshooting Connection Issues
 
-If you're experiencing connection problems between lan-mouse daemons (e.g., "Connection timed out" errors), please refer to the [Connection Troubleshooting Guide](docs/CONNECTION_TROUBLESHOOTING.md) for detailed diagnostic steps and solutions.
+If you're experiencing connection problems between lan-mouse daemons, please refer to these troubleshooting guides:
+
+- **[Connection Troubleshooting Guide](docs/CONNECTION_TROUBLESHOOTING.md)** - General connection issues (e.g., "Connection timed out" errors)
+- **[Broken Pipe Error Guide](BROKEN_PIPE_TROUBLESHOOTING.md)** - Certificate authorization issues (e.g., "DTLS handshake failed: Broken pipe" error)
+- **[macOS Accessibility Permissions Guide](MACOS_ACCESSIBILITY_TROUBLESHOOTING.md)** - macOS-specific issues with "event tap creation failed"
+- **[DTLS Handshake Fix](DTLS_HANDSHAKE_FIX.md)** - Certificate authorization for Linux to macOS connections
 
 A diagnostic script is also available to help identify network connectivity issues:
 
 ```bash
 ./scripts/diagnose-connection.sh [remote-ip]
 ```
+
+#### Common Errors
+
+##### "Broken pipe (os error 32)"
+
+If you see this error:
+```
+[ERROR] DTLS handshake failed with 15.1.30.54:4242: io error: Broken pipe (os error 32)
+```
+
+This means the remote daemon is rejecting your connection because your certificate fingerprint is not in its `authorized_fingerprints` list. See the [Broken Pipe Error Guide](BROKEN_PIPE_TROUBLESHOOTING.md) for step-by-step instructions to fix this.
+
+##### "event tap creation failed" (macOS)
+
+If you see this error on macOS:
+```
+[ERROR input_capture] No input capture backend available. Tried: [MacOs]
+[WARN lan_mouse::capture] input capture exited: error creating input-capture: `no backend available`
+```
+
+This means lan-mouse doesn't have Accessibility permissions on macOS. See the [macOS Accessibility Permissions Guide](MACOS_ACCESSIBILITY_TROUBLESHOOTING.md) for instructions to grant the necessary permissions.
 
 ## Roadmap
 - [x] Graphical frontend (gtk + libadwaita)

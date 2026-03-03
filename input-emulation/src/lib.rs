@@ -8,6 +8,32 @@ use input_event::{Event, KeyboardEvent};
 
 pub use self::error::{EmulationCreationError, EmulationError, InputEmulationError};
 
+/// Display server type
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DisplayServer {
+    X11,
+    Wayland,
+    Unknown,
+}
+
+/// Detect the active display server type
+fn detect_display_server() -> DisplayServer {
+    // Check for Wayland first (WAYLAND_DISPLAY is set by Wayland compositors)
+    if std::env::var("WAYLAND_DISPLAY").is_ok() {
+        log::info!("Detected Wayland display server");
+        return DisplayServer::Wayland;
+    }
+
+    // Check for X11 (DISPLAY is set by X servers)
+    if std::env::var("DISPLAY").is_ok() {
+        log::info!("Detected X11 display server");
+        return DisplayServer::X11;
+    }
+
+    log::warn!("Unable to detect display server type (neither WAYLAND_DISPLAY nor DISPLAY set)");
+    DisplayServer::Unknown
+}
+
 #[cfg(windows)]
 mod windows;
 
@@ -108,31 +134,79 @@ impl InputEmulation {
             return b;
         }
 
-        for backend in [
-            #[cfg(all(unix, feature = "wlroots", not(target_os = "macos")))]
-            Backend::Wlroots,
-            #[cfg(all(unix, feature = "libei", not(target_os = "macos")))]
-            Backend::Libei,
-            #[cfg(all(unix, feature = "remote_desktop_portal", not(target_os = "macos")))]
-            Backend::Xdp,
-            #[cfg(all(unix, feature = "x11", not(target_os = "macos")))]
-            Backend::X11,
-            #[cfg(windows)]
-            Backend::Windows,
-            #[cfg(target_os = "macos")]
-            Backend::MacOs,
-            Backend::Dummy,
-        ] {
-            match Self::with_backend(backend).await {
+        // Detect the active display server type
+        let display_server = detect_display_server();
+
+        // Select appropriate backends based on detected display server
+        let backends: Vec<Backend> = match display_server {
+            DisplayServer::Wayland => {
+                log::info!("Wayland detected, trying Wayland-compatible backends first");
+                vec![
+                    #[cfg(all(unix, feature = "wlroots", not(target_os = "macos")))]
+                    Backend::Wlroots,
+                    #[cfg(all(unix, feature = "libei", not(target_os = "macos")))]
+                    Backend::Libei,
+                    #[cfg(all(unix, feature = "remote_desktop_portal", not(target_os = "macos")))]
+                    Backend::Xdp,
+                    #[cfg(all(unix, feature = "x11", not(target_os = "macos")))]
+                    Backend::X11, // Fallback to X11 via XWayland
+                ]
+            }
+            DisplayServer::X11 => {
+                log::info!("X11 detected, trying X11 backend first");
+                vec![
+                    #[cfg(all(unix, feature = "x11", not(target_os = "macos")))]
+                    Backend::X11,
+                    #[cfg(all(unix, feature = "wlroots", not(target_os = "macos")))]
+                    Backend::Wlroots,
+                    #[cfg(all(unix, feature = "libei", not(target_os = "macos")))]
+                    Backend::Libei,
+                    #[cfg(all(unix, feature = "remote_desktop_portal", not(target_os = "macos")))]
+                    Backend::Xdp,
+                ]
+            }
+            DisplayServer::Unknown => {
+                log::warn!("Display server type unknown, trying all available backends");
+                vec![
+                    #[cfg(all(unix, feature = "x11", not(target_os = "macos")))]
+                    Backend::X11,
+                    #[cfg(all(unix, feature = "wlroots", not(target_os = "macos")))]
+                    Backend::Wlroots,
+                    #[cfg(all(unix, feature = "libei", not(target_os = "macos")))]
+                    Backend::Libei,
+                    #[cfg(all(unix, feature = "remote_desktop_portal", not(target_os = "macos")))]
+                    Backend::Xdp,
+                    #[cfg(windows)]
+                    Backend::Windows,
+                    #[cfg(target_os = "macos")]
+                    Backend::MacOs,
+                    Backend::Dummy,
+                ]
+            }
+        };
+
+        for backend in &backends {
+            log::info!(
+                "Attempting to create {} input emulation backend...",
+                backend
+            );
+            match Self::with_backend(*backend).await {
                 Ok(b) => {
-                    log::info!("using emulation backend: {backend}");
+                    log::info!("Successfully created emulation backend: {backend}");
                     return Ok(b);
                 }
                 Err(e) if e.cancelled_by_user() => return Err(e),
-                Err(e) => log::warn!("{e}"),
+                Err(e) => {
+                    log::warn!("Failed to create {} emulation backend: {}", backend, e);
+                    log::warn!("Trying next available backend...");
+                }
             }
         }
 
+        log::error!(
+            "No input emulation backend available. Tried: {:?}",
+            backends
+        );
         Err(EmulationCreationError::NoAvailableBackend)
     }
 
@@ -210,6 +284,22 @@ impl InputEmulation {
             .is_some_and(|p| !p.is_empty())
     }
 
+    /// Check if the cursor has crossed a screen edge
+    /// Returns Some(()) if an edge was crossed, None otherwise
+    pub async fn check_edge_crossing(&mut self) -> Option<()> {
+        self.emulation.check_edge_crossing().await
+    }
+
+    /// Set the entry edge when a client enters from a specific direction
+    pub async fn set_entry_edge(&mut self, position: lan_mouse_ipc::Position) {
+        self.emulation.set_entry_edge(position).await;
+    }
+
+    /// Clear the entry edge when a client leaves
+    pub async fn clear_entry_edge(&mut self) {
+        self.emulation.clear_entry_edge().await;
+    }
+
     /// update the pressed_keys for the given handle
     /// returns whether the event should be processed
     fn update_pressed_keys(&mut self, handle: EmulationHandle, key: u32, state: u8) -> bool {
@@ -237,4 +327,16 @@ trait Emulation: Send {
     async fn create(&mut self, handle: EmulationHandle);
     async fn destroy(&mut self, handle: EmulationHandle);
     async fn terminate(&mut self);
+    
+    /// Check if the cursor has crossed a screen edge
+    /// Returns Some(edge_position) if an edge was crossed, None otherwise
+    async fn check_edge_crossing(&mut self) -> Option<()> {
+        None
+    }
+
+    /// Set the entry edge when a client enters from a specific direction
+    async fn set_entry_edge(&mut self, position: lan_mouse_ipc::Position);
+
+    /// Clear the entry edge when a client leaves
+    async fn clear_entry_edge(&mut self);
 }

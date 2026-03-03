@@ -28,6 +28,7 @@ tokio = { version = "1.32.0", features = [
 once_cell = "1.19.0"
 async-trait = "0.1.81"
 tokio-util = "0.7.11"
+scopeguard = "1.2"
 
 
 [target.'cfg(all(unix, not(target_os="macos")))'.dependencies]
@@ -40,11 +41,12 @@ wayland-protocols = { version = "0.32.1", features = [
 wayland-protocols-wlr = { version = "0.3.1", features = [
     "client",
 ], optional = true }
-x11 = { version = "2.21.0", features = ["xlib", "xtest"], optional = true }
+x11 = { version = "2.21.0", features = ["xlib", "xtest", "xrecord"], optional = true }
 ashpd = { version = "0.11.0", default-features = false, features = [
     "tokio",
 ], optional = true }
 reis = { version = "0.5.0", features = ["tokio"], optional = true }
+libc = "0.2.155"
 
 [target.'cfg(target_os="macos")'.dependencies]
 core-graphics = { version = "0.25.0", features = ["highsierra"] }

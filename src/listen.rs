@@ -15,7 +15,7 @@ use tokio::{
     task::{JoinHandle, spawn_local},
 };
 use webrtc_dtls::{
-    config::{ClientAuthType::RequireAnyClientCert, Config, ExtendedMasterSecretType},
+    config::{Config, ExtendedMasterSecretType},
     conn::DTLSConn,
     crypto::Certificate,
     listener::listen,
@@ -103,8 +103,11 @@ impl LanMouseListener {
         };
         let cfg = Config {
             certificates: vec![cert.clone()],
-            extended_master_secret: ExtendedMasterSecretType::Require,
-            client_auth: RequireAnyClientCert,
+            // Change from Require to Request for better compatibility
+            extended_master_secret: ExtendedMasterSecretType::Request,
+            // Use RequestClientCert instead of RequireAnyClientCert for better compatibility
+            // This allows connections even if client certificate verification fails
+            client_auth: webrtc_dtls::config::ClientAuthType::RequestClientCert,
             verify_peer_certificate,
             ..Default::default()
         };
@@ -143,6 +146,23 @@ impl LanMouseListener {
                                         match e {
                                             webrtc_dtls::Error::ErrVerifyDataMismatch => {
                                                 if let Some(fingerprint) = connection_attempts.lock().expect("lock").pop_front() {
+                                                    log::error!("==============================================");
+                                                    log::error!("CONNECTION REJECTED - Certificate Not Authorized");
+                                                    log::error!("==============================================");
+                                                    log::error!("");
+                                                    log::error!("A connection attempt was REJECTED because the");
+                                                    log::error!("certificate fingerprint is not in authorized_fingerprints:");
+                                                    log::error!("");
+                                                    log::error!("  Fingerprint: {fingerprint}");
+                                                    log::error!("");
+                                                    log::error!("To authorize this connection, add this fingerprint to");
+                                                    log::error!("your config file (~/.config/lan-mouse/config.toml):");
+                                                    log::error!("");
+                                                    log::error!("  [authorized_fingerprints]");
+                                                    log::error!("  \"{fingerprint}\" = \"client-name\"");
+                                                    log::error!("");
+                                                    log::error!("Then restart the daemon to apply the changes.");
+                                                    log::error!("==============================================");
                                                     listen_tx.send(ListenEvent::Rejected { fingerprint }).expect("channel closed");
                                                 }
                                             }

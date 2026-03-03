@@ -47,25 +47,103 @@ async fn connect(
     cert: Certificate,
 ) -> Result<(Arc<dyn Conn + Sync + Send>, SocketAddr), (SocketAddr, LanMouseConnectionError)> {
     log::info!("connecting to {addr} ...");
+    log::debug!("Creating UDP socket for connection to {addr}");
     let conn = Arc::new(
         UdpSocket::bind("0.0.0.0:0")
             .await
-            .map_err(|e| (addr, e.into()))?,
+            .map_err(|e| {
+                log::error!("Failed to bind UDP socket: {e}");
+                (addr, e.into())
+            })?,
     );
-    conn.connect(addr).await.map_err(|e| (addr, e.into()))?;
+    log::debug!("Connecting UDP socket to {addr}");
+    conn.connect(addr).await.map_err(|e| {
+        log::error!("Failed to connect UDP socket to {addr}: {e}");
+        (addr, e.into())
+    })?;
     let config = Config {
         certificates: vec![cert],
         server_name: "ignored".to_owned(),
         insecure_skip_verify: true,
-        extended_master_secret: ExtendedMasterSecretType::Require,
+        // Use Request instead of Require for better compatibility with different DTLS implementations
+        extended_master_secret: ExtendedMasterSecretType::Request,
+        // Request client certificate from server (server may or may not require it)
+        client_auth: webrtc_dtls::config::ClientAuthType::RequestClientCert,
         ..Default::default()
     };
+    log::debug!("Starting DTLS handshake with {addr} (timeout: {:?})", DEFAULT_CONNECTION_TIMEOUT);
     let timeout = tokio::time::sleep(DEFAULT_CONNECTION_TIMEOUT);
     tokio::select! {
-        _ = timeout => Err((addr, LanMouseConnectionError::Timeout)),
+        _ = timeout => {
+            log::error!("Connection to {addr} timed out after {:?}", DEFAULT_CONNECTION_TIMEOUT);
+            log::error!("This typically means:");
+            log::error!("  1. The remote lan-mouse daemon is not running");
+            log::error!("  2. The remote daemon is not listening on port {}", addr.port());
+            log::error!("  3. A firewall is blocking the connection");
+            log::error!("  4. The IP address {} is incorrect or unreachable", addr.ip());
+            log::error!("");
+            log::error!("Troubleshooting steps:");
+            log::error!("  1. Run the diagnostic script: ./scripts/diagnose-connection.sh {}", addr.ip());
+            log::error!("  2. Check if lan-mouse is running on the remote machine: ssh {} 'pgrep -f lan-mouse'", addr.ip());
+            log::error!("  3. Test network connectivity: ping -c 3 {}", addr.ip());
+            log::error!("  4. Check if the port is open: nc -zv {} {}", addr.ip(), addr.port());
+            log::error!("  5. Verify firewall settings on both machines");
+            Err((addr, LanMouseConnectionError::Timeout))
+        }
         result = DTLSConn::new(conn, config, true, None) => match result {
-            Ok(dtls_conn) => Ok((Arc::new(dtls_conn), addr)),
-            Err(e) => Err((addr, e.into())),
+            Ok(dtls_conn) => {
+                log::info!("Successfully established DTLS connection with {addr}");
+                Ok((Arc::new(dtls_conn), addr))
+            }
+            Err(e) => {
+                log::error!("DTLS handshake failed with {addr}: {e}");
+                
+                // Check if this is a "Broken pipe" error (certificate authorization issue)
+                let error_str = format!("{e}");
+                if error_str.contains("Broken pipe") || error_str.contains("os error 32") {
+                    log::error!("==============================================");
+                    log::error!("BROKEN PIPE ERROR - Certificate Authorization Issue");
+                    log::error!("==============================================");
+                    log::error!("");
+                    log::error!("The remote daemon ({addr}) is rejecting your connection");
+                    log::error!("because your certificate fingerprint is NOT in its");
+                    log::error!("authorized_fingerprints list.");
+                    log::error!("");
+                    log::error!("SOLUTION: Exchange certificate fingerprints between machines");
+                    log::error!("");
+                    log::error!("Step 1: Extract YOUR certificate fingerprint:");
+                    log::error!("  ./scripts/extract-fingerprint.sh");
+                    log::error!("");
+                    log::error!("Step 2: Add YOUR fingerprint to REMOTE machine's config:");
+                    log::error!("  On {addr}: Edit ~/.config/lan-mouse/config.toml");
+                    log::error!("  Add to [authorized_fingerprints] section");
+                    log::error!("");
+                    log::error!("Step 3: Extract REMOTE certificate fingerprint:");
+                    log::error!("  ssh {addr} './scripts/extract-fingerprint.sh'");
+                    log::error!("");
+                    log::error!("Step 4: Add REMOTE fingerprint to YOUR machine's config:");
+                    log::error!("  Edit ~/.config/lan-mouse/config.toml");
+                    log::error!("  Add to [authorized_fingerprints] section");
+                    log::error!("");
+                    log::error!("Step 5: Restart BOTH daemons:");
+                    log::error!("  pkill -f 'lan-mouse.*daemon' && lan-mouse daemon");
+                    log::error!("");
+                    log::error!("For detailed instructions, see: BROKEN_PIPE_TROUBLESHOOTING.md");
+                    log::error!("==============================================");
+                } else {
+                    log::error!("This may be due to:");
+                    log::error!("  - Network connectivity issues (firewall, NAT)");
+                    log::error!("  - DTLS version or cipher suite mismatch");
+                    log::error!("  - Certificate validation issues");
+                    log::error!("  - The remote device may not be running or may have a different version");
+                    log::error!("Try:");
+                    log::error!("  - Check if the remote device is running lan-mouse");
+                    log::error!("  - Verify network connectivity (ping {addr})");
+                    log::error!("  - Check firewall settings");
+                    log::error!("  - Ensure both devices are running compatible versions");
+                }
+                Err((addr, e.into()))
+            }
         }
     }
 }
@@ -74,17 +152,26 @@ async fn connect_any(
     addrs: &[SocketAddr],
     cert: Certificate,
 ) -> Result<(Arc<dyn Conn + Send + Sync>, SocketAddr), LanMouseConnectionError> {
+    log::debug!("Attempting to connect to {} address(es): {:?}", addrs.len(), addrs);
     let mut joinset = JoinSet::new();
     for &addr in addrs {
+        log::debug!("Spawning connection task for {addr}");
         joinset.spawn_local(connect(addr, cert.clone()));
     }
     loop {
         match joinset.join_next().await {
-            None => return Err(LanMouseConnectionError::NotConnected),
+            None => {
+                log::error!("All connection attempts failed for addresses: {:?}", addrs);
+                return Err(LanMouseConnectionError::NotConnected);
+            }
             Some(r) => match r.expect("join error") {
-                Ok(conn) => return Ok(conn),
+                Ok(conn) => {
+                    log::info!("Successfully connected to one of the addresses");
+                    return Ok(conn);
+                }
                 Err((a, e)) => {
-                    log::warn!("failed to connect to {a}: `{e}`")
+                    log::warn!("failed to connect to {a}: `{e}`");
+                    log::debug!("Remaining connection attempts: {}", joinset.len());
                 }
             },
         };
@@ -139,7 +226,7 @@ impl LanMouseConnection {
                     Ok(_) => {}
                     Err(e) => {
                         log::warn!("client {handle} failed to send: {e}");
-                        disconnect(&self.client_manager, handle, addr, &self.conns).await;
+                        disconnect(&self.client_manager, handle, addr, &self.conns, &self.recv_tx).await;
                     }
                 }
                 log::trace!("{event} >->->->->- {addr}");
@@ -184,10 +271,13 @@ async fn connect_to_handle(
             .map(|a| SocketAddr::new(a, port))
             .collect::<Vec<_>>();
         log::info!("client ({handle}) connecting ... (ips: {addrs:?})");
+        log::debug!("Attempting to connect to {} address(es)", addrs.len());
         let res = connect_any(&addrs, cert).await;
         let (conn, addr) = match res {
             Ok(c) => c,
             Err(e) => {
+                log::warn!("Failed to connect client {handle} to any of the addresses: {e}");
+                log::warn!("Client {handle} will remain disconnected until the remote daemon becomes available");
                 connecting.lock().await.remove(&handle);
                 return Err(e);
             }
@@ -212,6 +302,7 @@ async fn connect_to_handle(
         ));
         return Ok(());
     }
+    log::warn!("No IP addresses configured for client {handle}");
     connecting.lock().await.remove(&handle);
     Err(LanMouseConnectionError::NotConnected)
 }
@@ -268,7 +359,7 @@ async fn receive_loop(
         }
     }
     log::warn!("recv error");
-    disconnect(&client_manager, handle, addr, &conns).await;
+    disconnect(&client_manager, handle, addr, &conns, &tx).await;
 }
 
 async fn disconnect(
@@ -276,10 +367,19 @@ async fn disconnect(
     handle: ClientHandle,
     addr: SocketAddr,
     conns: &Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>,
+    tx: &Sender<(ClientHandle, ProtoEvent)>,
 ) {
     log::warn!("client ({handle}) @ {addr} connection closed");
     conns.lock().await.remove(&addr);
     client_manager.set_active_addr(handle, None);
+    
+    // Notify capture task about disconnection by sending Leave event
+    // This ensures the capture state is reset properly
+    log::info!("sending Leave event to capture task for handle {handle} due to disconnect");
+    if let Err(e) = tx.send((handle, ProtoEvent::Leave(0))) {
+        log::warn!("failed to send disconnect notification to capture task: {e}");
+    }
+    
     let active: Vec<SocketAddr> = conns.lock().await.keys().copied().collect();
     log::info!("active connections: {active:?}");
 }

@@ -29,4 +29,10 @@ impl Emulation for DummyEmulation {
     async fn terminate(&mut self) {
         /* nothing to do */
     }
+    async fn set_entry_edge(&mut self, _position: lan_mouse_ipc::Position) {
+        /* nothing to do */
+    }
+    async fn clear_entry_edge(&mut self) {
+        /* nothing to do */
+    }
 }

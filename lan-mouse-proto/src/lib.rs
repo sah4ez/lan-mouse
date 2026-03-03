@@ -1,4 +1,5 @@
 use input_event::{Event as InputEvent, KeyboardEvent, PointerEvent};
+use lan_mouse_ipc::Position as IpcPosition;
 use num_enum::{IntoPrimitive, TryFromPrimitive, TryFromPrimitiveError};
 use paste::paste;
 use std::{
@@ -42,6 +43,28 @@ impl Display for Position {
             Position::Bottom => "bottom",
         };
         write!(f, "{pos}")
+    }
+}
+
+impl From<IpcPosition> for Position {
+    fn from(pos: IpcPosition) -> Self {
+        match pos {
+            IpcPosition::Left => Position::Left,
+            IpcPosition::Right => Position::Right,
+            IpcPosition::Top => Position::Top,
+            IpcPosition::Bottom => Position::Bottom,
+        }
+    }
+}
+
+impl From<Position> for IpcPosition {
+    fn from(pos: Position) -> Self {
+        match pos {
+            Position::Left => IpcPosition::Left,
+            Position::Right => IpcPosition::Right,
+            Position::Top => IpcPosition::Top,
+            Position::Bottom => IpcPosition::Bottom,
+        }
     }
 }
 

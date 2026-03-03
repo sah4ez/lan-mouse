@@ -1,10 +1,28 @@
 /target
-.gdbinit
+/plans
+/x2x
+
+# Rust
+**/*.rs.bk
+*.pdb
+Cargo.lock
+
+# IDEs and editors
 .idea/
 .vs/
 .vscode/
+*.swp
+*.swo
+*~
+.gdbinit
+
+# direnv
 .direnv/
+
+# Nix
 result
+
+# Certificates
 *.pem
 *.csr
 extfile.conf
@@ -12,3 +30,31 @@ extfile.conf
 # flatpak files
 .flatpak-builder
 repo
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Backup files
+*.bak
+*.backup
+
+# Test and coverage
+*.profraw
+*.profdata
+*.prof
+
+# Documentation
+/doc
+
+# Build artifacts
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Logs
+*.log

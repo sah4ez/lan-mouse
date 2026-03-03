@@ -15,6 +15,35 @@ pub use error::{CaptureCreationError, CaptureError, InputCaptureError};
 
 pub mod error;
 
+type CaptureResult = Result<(Position, CaptureEvent), CaptureError>;
+type CaptureStream = Box<dyn Capture<Item = CaptureResult>>;
+
+/// Display server type
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DisplayServer {
+    X11,
+    Wayland,
+    Unknown,
+}
+
+/// Detect the active display server type
+fn detect_display_server() -> DisplayServer {
+    // Check for Wayland first (WAYLAND_DISPLAY is set by Wayland compositors)
+    if std::env::var("WAYLAND_DISPLAY").is_ok() {
+        log::info!("Detected Wayland display server");
+        return DisplayServer::Wayland;
+    }
+
+    // Check for X11 (DISPLAY is set by X servers)
+    if std::env::var("DISPLAY").is_ok() {
+        log::info!("Detected X11 display server");
+        return DisplayServer::X11;
+    }
+
+    log::warn!("Unable to detect display server type (neither WAYLAND_DISPLAY nor DISPLAY set)");
+    DisplayServer::Unknown
+}
+
 #[cfg(all(unix, feature = "libei", not(target_os = "macos")))]
 mod libei;
 
@@ -127,6 +156,8 @@ pub struct InputCapture {
     id_map: HashMap<CaptureHandle, Position>,
     /// pending events
     pending: VecDeque<(CaptureHandle, CaptureEvent)>,
+    /// special handle for global keyboard events (used for release bind)
+    global_keyboard_handle: CaptureHandle,
 }
 
 impl InputCapture {
@@ -179,27 +210,43 @@ impl InputCapture {
     /// creates a new [`InputCapture`]
     pub async fn new(backend: Option<Backend>) -> Result<Self, CaptureCreationError> {
         let capture = create(backend).await?;
+        // Use a special handle value for global keyboard events
+        // This handle is used to ensure keyboard events are always processed
+        // for the release bind check, even when there's no active capture
+        const GLOBAL_KEYBOARD_HANDLE: CaptureHandle = u64::MAX;
         Ok(Self {
             capture,
             id_map: Default::default(),
             pending: Default::default(),
             position_map: Default::default(),
             pressed_keys: HashSet::new(),
+            global_keyboard_handle: GLOBAL_KEYBOARD_HANDLE,
         })
     }
 
     /// check whether the given keys are pressed
     pub fn keys_pressed(&self, keys: &[scancode::Linux]) -> bool {
-        keys.iter().all(|k| self.pressed_keys.contains(k))
+        log::debug!("keys_pressed() called with release bind: {:?}", keys);
+        log::debug!("Currently pressed keys: {:?}", self.pressed_keys);
+        let result = keys.iter().all(|k| self.pressed_keys.contains(k));
+        log::debug!("keys_pressed() result: {}", result);
+        result
     }
 
     fn update_pressed_keys(&mut self, key: u32, state: u8) {
         if let Ok(scancode) = scancode::Linux::try_from(key) {
-            log::debug!("key: {key}, state: {state}, scancode: {scancode:?}");
             match state {
-                1 => self.pressed_keys.insert(scancode),
-                _ => self.pressed_keys.remove(&scancode),
+                1 => {
+                    self.pressed_keys.insert(scancode);
+                    log::debug!("Key pressed: scancode {:?} (keycode {}), total pressed: {:?}", scancode, key, self.pressed_keys);
+                }
+                _ => {
+                    self.pressed_keys.remove(&scancode);
+                    log::debug!("Key released: scancode {:?} (keycode {}), total pressed: {:?}", scancode, key, self.pressed_keys);
+                }
             };
+        } else {
+            log::warn!("Failed to convert keycode {} to scancode", key);
         }
     }
 }
@@ -230,9 +277,15 @@ impl Stream for InputCapture {
             Err(e) => return Poll::Ready(Some(Err(e))),
         };
 
-        // handle key presses
-        if let CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { key, state, .. })) = event {
-            self.update_pressed_keys(key, state);
+        log::trace!("InputCapture::poll_next: received event at position {:?}", pos);
+
+        // handle key presses - always process keyboard events to update pressed_keys
+        // even when there's no active capture at this position
+        let is_keyboard_event = matches!(event, CaptureEvent::Input(Event::Keyboard(_)));
+        if is_keyboard_event {
+            if let CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { key, state, .. })) = event {
+                self.update_pressed_keys(key, state);
+            }
         }
 
         let len = self
@@ -242,12 +295,26 @@ impl Stream for InputCapture {
             .unwrap_or(0);
 
         match len {
-            0 => Poll::Pending,
-            1 => Poll::Ready(Some(Ok((
-                self.position_map.get(&pos).expect("no id")[0],
-                event,
-            )))),
+            0 => {
+                // If there's no capture at this position, but it's a keyboard event,
+                // return it with the global keyboard handle so the release bind can be checked
+                if is_keyboard_event {
+                    log::debug!("InputCapture::poll_next: no capture at position {:?}, returning keyboard event with global handle", pos);
+                    Poll::Ready(Some(Ok((self.global_keyboard_handle, event))))
+                } else {
+                    log::trace!("InputCapture::poll_next: no capture at position {:?}, returning Pending", pos);
+                    Poll::Pending
+                }
+            }
+            1 => {
+                log::trace!("InputCapture::poll_next: returning event to handle {:?}", self.position_map.get(&pos).expect("no id")[0]);
+                Poll::Ready(Some(Ok((
+                    self.position_map.get(&pos).expect("no id")[0],
+                    event,
+                ))))
+            }
             _ => {
+                log::debug!("InputCapture::poll_next: multiple captures at position {:?}, queuing events", pos);
                 let mut position_map = HashMap::new();
                 swap(&mut self.position_map, &mut position_map);
                 {
@@ -301,10 +368,7 @@ async fn create_backend(
 
 async fn create(
     backend: Option<Backend>,
-) -> Result<
-    Box<dyn Capture<Item = Result<(Position, CaptureEvent), CaptureError>>>,
-    CaptureCreationError,
-> {
+) -> Result<CaptureStream, CaptureCreationError> {
     if let Some(backend) = backend {
         let b = create_backend(backend).await;
         if b.is_ok() {
@@ -313,26 +377,64 @@ async fn create(
         return b;
     }
 
-    for backend in [
-        #[cfg(all(unix, feature = "libei", not(target_os = "macos")))]
-        Backend::InputCapturePortal,
-        #[cfg(all(unix, feature = "layer_shell", not(target_os = "macos")))]
-        Backend::LayerShell,
-        #[cfg(all(unix, feature = "x11", not(target_os = "macos")))]
-        Backend::X11,
-        #[cfg(windows)]
-        Backend::Windows,
-        #[cfg(target_os = "macos")]
-        Backend::MacOs,
-    ] {
-        match create_backend(backend).await {
+    // Detect the active display server type
+    let display_server = detect_display_server();
+
+    // Select appropriate backends based on detected display server
+    let backends: Vec<Backend> = match display_server {
+        DisplayServer::Wayland => {
+            log::info!("Wayland detected, trying Wayland-compatible backends first");
+            vec![
+                #[cfg(all(unix, feature = "libei", not(target_os = "macos")))]
+                Backend::InputCapturePortal,
+                #[cfg(all(unix, feature = "layer_shell", not(target_os = "macos")))]
+                Backend::LayerShell,
+                #[cfg(all(unix, feature = "x11", not(target_os = "macos")))]
+                Backend::X11, // Fallback to X11 via XWayland
+            ]
+        }
+        DisplayServer::X11 => {
+            log::info!("X11 detected, trying X11 backend first");
+            vec![
+                #[cfg(all(unix, feature = "x11", not(target_os = "macos")))]
+                Backend::X11,
+                #[cfg(all(unix, feature = "libei", not(target_os = "macos")))]
+                Backend::InputCapturePortal,
+                #[cfg(all(unix, feature = "layer_shell", not(target_os = "macos")))]
+                Backend::LayerShell,
+            ]
+        }
+        DisplayServer::Unknown => {
+            log::warn!("Display server type unknown, trying all available backends");
+            vec![
+                #[cfg(all(unix, feature = "x11", not(target_os = "macos")))]
+                Backend::X11,
+                #[cfg(all(unix, feature = "libei", not(target_os = "macos")))]
+                Backend::InputCapturePortal,
+                #[cfg(all(unix, feature = "layer_shell", not(target_os = "macos")))]
+                Backend::LayerShell,
+                #[cfg(windows)]
+                Backend::Windows,
+                #[cfg(target_os = "macos")]
+                Backend::MacOs,
+            ]
+        }
+    };
+
+    for backend in &backends {
+        log::info!("Attempting to create {} input capture backend...", backend);
+        match create_backend(*backend).await {
             Ok(b) => {
-                log::info!("using capture backend: {backend}");
+                log::info!("Successfully created capture backend: {backend}");
                 return Ok(b);
             }
             Err(e) if e.cancelled_by_user() => return Err(e),
-            Err(e) => log::warn!("{backend} input capture backend unavailable: {e}"),
+            Err(e) => {
+                log::warn!("Failed to create {} input capture backend: {}", backend, e);
+                log::warn!("Trying next available backend...");
+            }
         }
     }
+    log::error!("No input capture backend available. Tried: {:?}", backends);
     Err(CaptureCreationError::NoAvailableBackend)
 }

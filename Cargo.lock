@@ -1681,6 +1681,7 @@ dependencies = [
  "memmap",
  "once_cell",
  "reis",
+ "scopeguard",
  "tempfile",
  "thiserror 2.0.12",
  "tokio",
@@ -1703,11 +1704,17 @@ dependencies = [
  "futures",
  "input-event",
  "keycode",
+ "lan-mouse-ipc",
  "log",
  "once_cell",
  "reis",
+ "serde",
+ "serde_json",
  "thiserror 2.0.12",
  "tokio",
+ "tokio-test",
+ "tracing",
+ "tracing-subscriber",
  "wayland-client",
  "wayland-protocols",
  "wayland-protocols-misc",
@@ -1920,6 +1927,7 @@ name = "lan-mouse-proto"
 version = "0.2.0"
 dependencies = [
  "input-event",
+ "lan-mouse-ipc",
  "num_enum",
  "paste",
  "thiserror 2.0.12",
@@ -3273,6 +3281,17 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+]
+
+[[package]]
+name = "tokio-test"
+version = "0.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6d24790a10a7af737693a3e8f1d03faef7e6ca0cc99aae5066f533766de545"
+dependencies = [
+ "futures-core",
+ "tokio",
+ "tokio-stream",
 ]
 
 [[package]]

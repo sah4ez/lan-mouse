@@ -123,6 +123,7 @@ impl Service {
         let resolver = DnsResolver::new()?;
 
         let port = config.port();
+
         let service = Self {
             config,
             capture,
@@ -169,6 +170,7 @@ impl Service {
         }
 
         log::info!("terminating service ...");
+
         log::debug!("terminating capture ...");
         self.capture.terminate().await;
         log::debug!("terminating emulation ...");
@@ -259,6 +261,11 @@ impl Service {
         while let Some(event) = self.pending_frontend_events.pop_front() {
             self.frontend_listener.broadcast(event).await;
         }
+        // Ensure status consistency after sending events
+        if self.capture_status == Status::Enabled && self.emulation_status != Status::Enabled {
+            log::debug!("capture enabled but emulation disabled, reenabling emulation");
+            self.emulation.reenable();
+        }
     }
 
     fn handle_emulation_event(&mut self, event: EmulationEvent) {
@@ -271,9 +278,26 @@ impl Service {
                 pos,
                 fingerprint,
             } => {
+                // Calculate the exit edge (opposite of entry)
+                let exit_edge = pos.opposite();
+                
+                log::info!(
+                    "Service::EmulationEvent::Entered: === REMOTE CURSOR ENTERED ==="
+                );
+                log::info!(
+                    "Service::EmulationEvent::Entered: remote_addr={} | fingerprint={} | entry_edge={:?} | exit_edge={:?}",
+                    addr, fingerprint, pos, exit_edge
+                );
+                log::info!(
+                    "Service::EmulationEvent::Entered: cursor will appear on {:?} edge of this screen, control returns when crossing {:?} edge",
+                    pos, exit_edge
+                );
+                
                 // check if already registered
                 if !self.incoming_conns.contains(&addr) {
                     self.add_incoming(addr, pos, fingerprint.clone());
+                    // Set the entry edge so cursor can only exit through opposite edge
+                    self.emulation.set_entry_edge(pos);
                     self.notify_frontend(FrontendEvent::DeviceEntered {
                         fingerprint,
                         addr,
@@ -287,6 +311,8 @@ impl Service {
                 if let Some(addr) = self.remove_incoming(addr) {
                     self.notify_frontend(FrontendEvent::IncomingDisconnected(addr));
                 }
+                // Clear the entry edge when a client disconnects
+                self.emulation.clear_entry_edge();
             }
             EmulationEvent::PortChanged(port) => match port {
                 Ok(port) => {
@@ -305,7 +331,53 @@ impl Service {
                 self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
             }
             EmulationEvent::ReleaseNotify => self.capture.release(),
+            EmulationEvent::EdgeCrossed => {
+                log::info!("control returning: cursor crossed exit edge, sending Leave event to incoming clients");
+                // Send Leave event to all incoming connections
+                for addr in self.incoming_conns.iter() {
+                    log::info!("sending Leave event to remote {}", addr);
+                    self.emulation.send_leave_event(*addr);
+                }
+                // Release capture on local machine
+                self.capture.release();
+            }
             EmulationEvent::Connected { addr, fingerprint } => {
+                log::info!(
+                    "Service::EmulationEvent::Connected: remote {} connected (fingerprint={})",
+                    addr, fingerprint
+                );
+                
+                // Try to find the configured position for this client based on fingerprint
+                let configured_pos = self.find_client_position_by_fingerprint(&fingerprint);
+                
+                if let Some(pos) = configured_pos {
+                    log::info!(
+                        "Service::EmulationEvent::Connected: found configured position for fingerprint {}: {:?}",
+                        fingerprint, pos
+                    );
+                    log::info!(
+                        "Service::EmulationEvent::Connected: setting entry_edge={:?} based on config (remote did not send ProtoEvent::Enter)",
+                        pos
+                    );
+                    
+                    // Add incoming connection with configured position
+                    if !self.incoming_conns.contains(&addr) {
+                        self.add_incoming(addr, pos, fingerprint.clone());
+                        // Set the entry edge so cursor can only exit through opposite edge
+                        self.emulation.set_entry_edge(pos);
+                        self.notify_frontend(FrontendEvent::DeviceEntered {
+                            fingerprint: fingerprint.clone(),
+                            addr,
+                            pos,
+                        });
+                    }
+                } else {
+                    log::warn!(
+                        "Service::EmulationEvent::Connected: no configured position found for fingerprint {}, edge detection will not work until ProtoEvent::Enter is received",
+                        fingerprint
+                    );
+                }
+                
                 self.notify_frontend(FrontendEvent::DeviceConnected { addr, fingerprint });
             }
         }
@@ -329,8 +401,13 @@ impl Service {
                 self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status));
             }
             ICaptureEvent::ClientEntered(handle) => {
-                log::info!("entering client {handle} ...");
+                log::info!("cursor entered client {handle} zone");
                 self.spawn_hook_command(handle);
+                // Ensure emulation is enabled when we enter a client
+                if self.emulation_status != Status::Enabled {
+                    log::debug!("ensuring emulation is enabled when entering client");
+                    self.emulation.reenable();
+                }
             }
         }
     }
@@ -471,6 +548,11 @@ impl Service {
         log::debug!("deactivating client {handle}");
         if self.client_manager.deactivate_client(handle) {
             self.capture.destroy(handle);
+            // Ensure capture is reenabled after deactivating a client
+            if self.capture_status == Status::Disabled {
+                log::debug!("reenabling capture after client deactivation");
+                self.capture.reenable();
+            }
             self.broadcast_client(handle);
             log::info!("deactivated client {handle}");
         }
@@ -495,6 +577,7 @@ impl Service {
 
         /* activate the client */
         if self.client_manager.activate_client(handle) {
+            log::info!("activated client {handle} at position: {:?}", self.client_manager.get_pos(handle));
             /* notify capture and frontends */
             self.capture.create(handle, pos, CaptureType::Default);
             self.broadcast_client(handle);
@@ -552,6 +635,30 @@ impl Service {
     fn update_enter_hook(&mut self, handle: ClientHandle, enter_hook: Option<String>) {
         self.client_manager.set_enter_hook(handle, enter_hook);
         self.broadcast_client(handle);
+    }
+
+    /// Find client position by fingerprint from authorized keys config
+    fn find_client_position_by_fingerprint(&self, fingerprint: &str) -> Option<Position> {
+        // Look up the client name from authorized fingerprints
+        let authorized_keys = self.authorized_keys.read().expect("lock");
+        let client_name = authorized_keys.get(fingerprint)?;
+        
+        // Find the client in the configured clients list by hostname
+        for client in self.config.clients() {
+            if client.hostname.as_deref() == Some(client_name.as_str()) {
+                log::info!(
+                    "Service::find_client_position: found client '{}' with position {:?} for fingerprint {}",
+                    client_name, client.pos, fingerprint
+                );
+                return Some(client.pos);
+            }
+        }
+        
+        log::debug!(
+            "Service::find_client_position: no configured client found for name '{}' (fingerprint {})",
+            client_name, fingerprint
+        );
+        None
     }
 
     fn broadcast_client(&mut self, handle: ClientHandle) {

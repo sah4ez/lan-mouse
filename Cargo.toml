@@ -24,7 +24,7 @@ strip = true
 panic = "abort"
 
 [build-dependencies]
-shadow-rs = "1.2.0"
+shadow-rs = { version = "1.2.0", optional = true }
 
 [dependencies]
 input-event = { path = "input-event", version = "0.3.0" }
@@ -34,7 +34,7 @@ lan-mouse-cli = { path = "lan-mouse-cli", version = "0.2.0" }
 lan-mouse-gtk = { path = "lan-mouse-gtk", version = "0.2.0", optional = true }
 lan-mouse-ipc = { path = "lan-mouse-ipc", version = "0.2.0" }
 lan-mouse-proto = { path = "lan-mouse-proto", version = "0.2.0" }
-shadow-rs = { version = "1.2.0", features = ["metadata"] }
+shadow-rs = { version = "1.2.0", features = ["metadata"], optional = true }
 
 hickory-resolver = "0.25.2"
 toml = "0.8"
@@ -81,6 +81,7 @@ default = [
     "libei_emulation",
     "rdp_emulation",
     "x11_emulation",
+    "shadow_rs",
 ]
 gtk = ["dep:lan-mouse-gtk"]
 layer_shell_capture = ["input-capture/layer_shell"]
@@ -90,6 +91,7 @@ libei_emulation = ["input-event/libei", "input-emulation/libei"]
 wlroots_emulation = ["input-emulation/wlroots"]
 x11_emulation = ["input-emulation/x11"]
 rdp_emulation = ["input-emulation/remote_desktop_portal"]
+shadow_rs = ["dep:shadow-rs"]
 
 [package.metadata.bundle]
 name = "Lan Mouse"

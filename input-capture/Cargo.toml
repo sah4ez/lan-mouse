@@ -41,7 +41,7 @@ wayland-protocols = { version = "0.32.1", features = [
 wayland-protocols-wlr = { version = "0.3.1", features = [
     "client",
 ], optional = true }
-x11 = { version = "2.21.0", features = ["xlib", "xtest", "xrecord", "xkb"], optional = true }
+x11 = { version = "2.21.0", features = ["xlib", "xtest", "xrecord"], optional = true }
 ashpd = { version = "0.11.0", default-features = false, features = [
     "tokio",
 ], optional = true }
@@ -74,5 +74,5 @@ layer_shell = [
     "dep:wayland-protocols",
     "dep:wayland-protocols-wlr",
 ]
-x11 = ["dep:x11", "x11/xkb"]
+x11 = ["dep:x11"]
 libei = ["dep:reis", "dep:ashpd"]

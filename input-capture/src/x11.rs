@@ -21,6 +21,14 @@ use input_event::{Event, KeyboardEvent, PointerEvent};
 use super::{Capture, CaptureError, CaptureEvent, Position, error::X11InputCaptureCreationError};
 
 // ============================================================================
+// XKB Constants
+// ============================================================================
+
+/// XkbUseCoreKbd - Use the core keyboard device
+/// This constant is defined as 0x0100 in the X11 XKB extension specification
+const XkbUseCoreKbd: u32 = 0x0100;
+
+// ============================================================================
 // X11 Error Handler
 // ============================================================================
 
@@ -232,7 +240,7 @@ impl X11ModifierState {
             let mut xkb_state: x11::xlib::XkbStateRec = std::mem::zeroed();
             let success = x11::xlib::XkbGetState(
                 display.get(),
-                x11::xlib::XkbUseCoreKbd,
+                XkbUseCoreKbd,
                 &mut xkb_state
             );
 

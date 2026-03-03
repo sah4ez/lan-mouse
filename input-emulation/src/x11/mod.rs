@@ -33,6 +33,14 @@ use crate::{
 };
 
 // ============================================================================
+// XKB Constants
+// ============================================================================
+
+/// XkbUseCoreKbd - Use the core keyboard device
+/// This constant is defined as 0x0100 in the X11 XKB extension specification
+const XkbUseCoreKbd: u32 = 0x0100;
+
+// ============================================================================
 // X11 Emulation Backend
 // ============================================================================
 
@@ -318,7 +326,7 @@ impl X11Emulation {
             // This is the proper way to switch layouts in X11
             let success = x11::xlib::XkbLockGroup(
                 self.display.get(),
-                x11::xlib::XkbUseCoreKbd,
+                XkbUseCoreKbd,
                 group
             );
 

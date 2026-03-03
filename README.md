@@ -199,7 +199,7 @@ scripts/copy-macos-dylib.sh
     <summary>Ubuntu and derivatives</summary>
 
 ```sh
-sudo apt install libadwaita-1-dev libgtk-4-dev libx11-dev libxtst-dev
+sudo apt install libadwaita-1-dev libgtk-4-dev libx11-dev libxi-dev libxrandr-dev libxtst-dev
 ```
 </details>
 
@@ -207,7 +207,7 @@ sudo apt install libadwaita-1-dev libgtk-4-dev libx11-dev libxtst-dev
     <summary>Arch and derivatives</summary>
 
 ```sh
-sudo pacman -S libadwaita gtk libx11 libxtst
+sudo pacman -S libadwaita gtk libx11 libxi libxrandr libxtst
 ```
 </details>
 
@@ -215,7 +215,7 @@ sudo pacman -S libadwaita gtk libx11 libxtst
     <summary>Fedora and derivatives</summary>
 
 ```sh
-sudo dnf install libadwaita-devel libXtst-devel libX11-devel
+sudo dnf install libadwaita-devel libXtst-devel libX11-devel libXi-devel libXrandr-devel
 ```
 </details>
 <details>

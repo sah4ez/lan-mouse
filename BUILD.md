@@ -104,6 +104,8 @@ lipo -create -output target/release/lan-mouse-universal \
 sudo apt-get update
 sudo apt-get install -y \
   libx11-dev \
+  libxi-dev \
+  libxrandr-dev \
   libxtst-dev \
   libadwaita-1-dev \
   libgtk-4-dev \
@@ -115,6 +117,8 @@ sudo apt-get install -y \
 ```bash
 sudo dnf install -y \
   libX11-devel \
+  libXi-devel \
+  libXrandr-devel \
   libXtst-devel \
   libadwaita-devel \
   gtk4-devel \
@@ -284,10 +288,10 @@ sudo apt-get install gcc-x86-64-linux-gnu
 **Solution:**
 ```bash
 # Debian/Ubuntu
-sudo apt-get install libx11-dev libxtst-dev
+sudo apt-get install libx11-dev libxi-dev libxrandr-dev libxtst-dev
 
 # Fedora
-sudo dnf install libX11-devel libXtst-devel
+sudo dnf install libX11-devel libXi-devel libXrandr-devel libXtst-devel
 ```
 
 #### Issue: "No input capture backend available" or "No input emulation backend available"
